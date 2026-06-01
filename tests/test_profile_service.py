@@ -158,6 +158,13 @@ class ProfileServiceTestCase(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(self.stub.submits, [])
 
+    def test_chat_prompt_prioritizes_latest_message_after_farewell(self) -> None:
+        prompt = profile_service.build_gateway_chat_turn(
+            [], "先这样吧，回头聊。", self.ENTERPRISE, knowledge_hits=[],
+        )
+        self.assertIn("以客户最新消息为准", prompt)
+        self.assertIn("告别不是永久状态", prompt)
+
     def test_gateway_failure_records_error(self) -> None:
         self.stub.error = RuntimeError("智能体超时")
         result = profile_service.schedule_profile_update(
