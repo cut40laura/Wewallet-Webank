@@ -1,0 +1,12 @@
+{
+  "name": "wewallet-realtime-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node doubao-realtime-proxy.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  }
+}

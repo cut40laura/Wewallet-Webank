@@ -1,0 +1,1000 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>微众钱包 | 智能风控客户经理 Agent</title>
+  <style>
+    :root {
+      --bg: #05070b;
+      --panel: rgba(13, 20, 32, 0.76);
+      --panel-strong: rgba(18, 29, 46, 0.92);
+      --line: rgba(112, 241, 255, 0.22);
+      --line-strong: rgba(112, 241, 255, 0.48);
+      --text: #eef8ff;
+      --muted: #9db3c6;
+      --soft: #d8edf8;
+      --cyan: #70f1ff;
+      --green: #52ffa8;
+      --gold: #ffd36a;
+      --red: #ff6f8f;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+      background:
+        radial-gradient(circle at 18% 12%, rgba(112, 241, 255, 0.2), transparent 30%),
+        radial-gradient(circle at 82% 6%, rgba(82, 255, 168, 0.13), transparent 28%),
+        radial-gradient(circle at 55% 90%, rgba(255, 111, 143, 0.1), transparent 32%),
+        linear-gradient(135deg, #020309 0%, #07101a 46%, #02040a 100%);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(112, 241, 255, 0.07) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(112, 241, 255, 0.07) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.9), transparent 85%);
+      z-index: 0;
+    }
+
+    .scanline {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background: linear-gradient(to bottom, transparent, rgba(112, 241, 255, 0.08), transparent);
+      height: 36vh;
+      animation: scan 7s linear infinite;
+      z-index: 1;
+    }
+
+    @keyframes scan {
+      from { transform: translateY(-45vh); }
+      to { transform: translateY(115vh); }
+    }
+
+    .page {
+      position: relative;
+      z-index: 2;
+    }
+
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 18px 5.8vw;
+      border-bottom: 1px solid rgba(112, 241, 255, 0.14);
+      background: rgba(2, 5, 10, 0.74);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 220px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border: 1px solid var(--line-strong);
+      background:
+        linear-gradient(135deg, rgba(112, 241, 255, 0.95), rgba(82, 255, 168, 0.55)),
+        linear-gradient(#fff, #fff);
+      box-shadow: 0 0 24px rgba(112, 241, 255, 0.45);
+      clip-path: polygon(50% 0, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%);
+    }
+
+    .nav-links {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+      padding: 8px 12px;
+      border: 1px solid transparent;
+    }
+
+    .nav-links a:hover {
+      color: var(--cyan);
+      border-color: var(--line);
+      background: rgba(112, 241, 255, 0.06);
+    }
+
+    .hero {
+      min-height: 92vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(360px, 0.95fr);
+      align-items: center;
+      gap: 48px;
+      padding: 7vh 5.8vw 8vh;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--green);
+      font-size: 14px;
+      padding: 8px 12px;
+      border: 1px solid rgba(82, 255, 168, 0.28);
+      background: rgba(82, 255, 168, 0.07);
+    }
+
+    .pulse {
+      width: 8px;
+      height: 8px;
+      background: var(--green);
+      box-shadow: 0 0 18px var(--green);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.45; transform: scale(0.82); }
+      50% { opacity: 1; transform: scale(1.12); }
+    }
+
+    h1 {
+      margin: 28px 0 22px;
+      max-width: 900px;
+      font-size: clamp(46px, 6vw, 92px);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    .title-gradient {
+      color: transparent;
+      background: linear-gradient(90deg, #ffffff 0%, #70f1ff 48%, #52ffa8 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      text-shadow: 0 0 34px rgba(112, 241, 255, 0.2);
+    }
+
+    .lead {
+      max-width: 780px;
+      color: var(--soft);
+      font-size: clamp(18px, 2vw, 25px);
+      line-height: 1.75;
+      margin: 0 0 34px;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-bottom: 36px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 46px;
+      padding: 12px 18px;
+      color: #001015;
+      font-weight: 700;
+      text-decoration: none;
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+      box-shadow: 0 0 28px rgba(112, 241, 255, 0.26);
+    }
+
+    .button.secondary {
+      color: var(--cyan);
+      background: rgba(112, 241, 255, 0.08);
+      border: 1px solid var(--line-strong);
+      box-shadow: none;
+    }
+
+    .metric-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      max-width: 760px;
+    }
+
+    .metric {
+      padding: 18px;
+      border: 1px solid var(--line);
+      background: rgba(9, 18, 30, 0.68);
+    }
+
+    .metric strong {
+      display: block;
+      color: var(--cyan);
+      font-size: 30px;
+      line-height: 1;
+      margin-bottom: 10px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .visual {
+      position: relative;
+      min-height: 570px;
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(135deg, rgba(112, 241, 255, 0.11), transparent 32%),
+        linear-gradient(315deg, rgba(82, 255, 168, 0.08), transparent 30%),
+        rgba(6, 12, 20, 0.78);
+      box-shadow: inset 0 0 42px rgba(112, 241, 255, 0.06), 0 0 80px rgba(0, 0, 0, 0.32);
+      overflow: hidden;
+    }
+
+    .visual::before {
+      content: "";
+      position: absolute;
+      inset: 28px;
+      border: 1px solid rgba(112, 241, 255, 0.18);
+    }
+
+    .hud-title {
+      position: absolute;
+      top: 32px;
+      left: 34px;
+      right: 34px;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .radar {
+      position: absolute;
+      top: 104px;
+      left: 50%;
+      width: min(360px, 74%);
+      aspect-ratio: 1;
+      transform: translateX(-50%);
+      border: 1px solid rgba(112, 241, 255, 0.3);
+      border-radius: 50%;
+      background:
+        radial-gradient(circle, rgba(112, 241, 255, 0.17) 0 2px, transparent 3px),
+        repeating-radial-gradient(circle, transparent 0 58px, rgba(112, 241, 255, 0.18) 59px 60px);
+      box-shadow: 0 0 50px rgba(112, 241, 255, 0.14);
+    }
+
+    .radar::before {
+      content: "";
+      position: absolute;
+      inset: 50% 50% 0 50%;
+      width: 48%;
+      height: 1px;
+      transform-origin: left center;
+      background: linear-gradient(90deg, var(--cyan), transparent);
+      animation: rotate 4.6s linear infinite;
+    }
+
+    .radar::after {
+      content: "";
+      position: absolute;
+      inset: 12%;
+      border-radius: 50%;
+      border: 1px dashed rgba(82, 255, 168, 0.28);
+    }
+
+    @keyframes rotate {
+      to { transform: rotate(360deg); }
+    }
+
+    .node {
+      position: absolute;
+      width: 11px;
+      height: 11px;
+      background: var(--green);
+      box-shadow: 0 0 18px var(--green);
+    }
+
+    .n1 { left: 24%; top: 32%; }
+    .n2 { left: 66%; top: 23%; background: var(--cyan); box-shadow: 0 0 18px var(--cyan); }
+    .n3 { left: 72%; top: 68%; background: var(--gold); box-shadow: 0 0 18px var(--gold); }
+    .n4 { left: 34%; top: 72%; background: var(--red); box-shadow: 0 0 18px var(--red); }
+
+    .hud-card {
+      position: absolute;
+      left: 34px;
+      right: 34px;
+      bottom: 34px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .signal {
+      display: grid;
+      grid-template-columns: 104px 1fr 62px;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid rgba(112, 241, 255, 0.16);
+      background: rgba(3, 8, 14, 0.72);
+      color: var(--soft);
+      font-size: 13px;
+    }
+
+    .bar {
+      height: 7px;
+      background: rgba(112, 241, 255, 0.13);
+      overflow: hidden;
+    }
+
+    .bar i {
+      display: block;
+      height: 100%;
+      background: linear-gradient(90deg, var(--cyan), var(--green));
+      box-shadow: 0 0 16px rgba(112, 241, 255, 0.4);
+    }
+
+    section {
+      padding: 78px 5.8vw;
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 28px;
+      margin-bottom: 30px;
+    }
+
+    .kicker {
+      color: var(--green);
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(30px, 4vw, 56px);
+      line-height: 1.12;
+      letter-spacing: 0;
+    }
+
+    .section-note {
+      max-width: 530px;
+      color: var(--muted);
+      line-height: 1.7;
+      font-size: 16px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .grid.four {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .card {
+      position: relative;
+      min-height: 230px;
+      padding: 24px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    .card::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 2px;
+      background: linear-gradient(90deg, var(--cyan), transparent);
+      opacity: 0.72;
+    }
+
+    .card-number {
+      color: rgba(112, 241, 255, 0.72);
+      font-size: 13px;
+      margin-bottom: 28px;
+    }
+
+    .card h3 {
+      margin: 0 0 14px;
+      font-size: 23px;
+      letter-spacing: 0;
+    }
+
+    .card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.78;
+      font-size: 15px;
+    }
+
+    .mini-list {
+      display: grid;
+      gap: 10px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    .mini-list span {
+      display: block;
+      padding-left: 16px;
+      position: relative;
+    }
+
+    .mini-list span::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0.72em;
+      width: 6px;
+      height: 6px;
+      background: var(--cyan);
+      box-shadow: 0 0 12px rgba(112, 241, 255, 0.8);
+    }
+
+    .wide {
+      grid-column: span 2;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      counter-reset: step;
+    }
+
+    .step {
+      min-height: 190px;
+      padding: 20px;
+      border: 1px solid rgba(112, 241, 255, 0.22);
+      background: rgba(4, 10, 18, 0.76);
+      position: relative;
+    }
+
+    .step::before {
+      counter-increment: step;
+      content: "0" counter(step);
+      color: var(--cyan);
+      font-weight: 700;
+      font-size: 28px;
+    }
+
+    .step h3 {
+      margin: 22px 0 10px;
+      font-size: 19px;
+    }
+
+    .step p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.65;
+      font-size: 14px;
+    }
+
+    .showcase {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(330px, 0.95fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .terminal {
+      padding: 24px;
+      border: 1px solid var(--line);
+      background: rgba(3, 8, 14, 0.88);
+      min-height: 420px;
+    }
+
+    .terminal-top {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 22px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--red);
+    }
+
+    .dot:nth-child(2) { background: var(--gold); }
+    .dot:nth-child(3) { background: var(--green); }
+
+    .dialogue {
+      display: grid;
+      gap: 14px;
+    }
+
+    .bubble {
+      padding: 15px 16px;
+      max-width: 88%;
+      color: var(--soft);
+      line-height: 1.68;
+      border: 1px solid rgba(112, 241, 255, 0.16);
+      background: rgba(112, 241, 255, 0.07);
+      font-size: 15px;
+    }
+
+    .bubble.agent {
+      margin-left: auto;
+      border-color: rgba(82, 255, 168, 0.18);
+      background: rgba(82, 255, 168, 0.07);
+    }
+
+    .profile {
+      padding: 24px;
+      border: 1px solid var(--line);
+      background: var(--panel-strong);
+    }
+
+    .profile h3 {
+      margin: 0 0 18px;
+      font-size: 24px;
+    }
+
+    .profile-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 13px 0;
+      border-bottom: 1px solid rgba(112, 241, 255, 0.12);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .profile-row strong {
+      color: var(--text);
+      text-align: right;
+    }
+
+    .risk {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      padding: 5px 10px;
+      color: #00130b;
+      background: var(--green);
+      font-weight: 700;
+    }
+
+    .quote {
+      padding: 42px;
+      border: 1px solid var(--line-strong);
+      background:
+        linear-gradient(90deg, rgba(112, 241, 255, 0.12), rgba(82, 255, 168, 0.05)),
+        rgba(6, 12, 20, 0.82);
+    }
+
+    .quote p {
+      margin: 0;
+      color: var(--text);
+      font-size: clamp(24px, 3vw, 42px);
+      line-height: 1.45;
+      font-weight: 700;
+    }
+
+    .quote span {
+      display: block;
+      margin-top: 20px;
+      color: var(--muted);
+      line-height: 1.7;
+      max-width: 900px;
+    }
+
+    footer {
+      padding: 34px 5.8vw 48px;
+      color: var(--muted);
+      border-top: 1px solid rgba(112, 241, 255, 0.14);
+      background: rgba(2, 5, 10, 0.62);
+      font-size: 14px;
+    }
+
+    @media (max-width: 1050px) {
+      .hero,
+      .showcase {
+        grid-template-columns: 1fr;
+      }
+
+      .visual {
+        min-height: 500px;
+      }
+
+      .grid,
+      .grid.four,
+      .flow {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .wide {
+        grid-column: span 1;
+      }
+    }
+
+    @media (max-width: 680px) {
+      .nav {
+        position: relative;
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .nav-links {
+        justify-content: flex-start;
+      }
+
+      .hero {
+        padding-top: 48px;
+      }
+
+      .metric-row,
+      .grid,
+      .grid.four,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+
+      .visual {
+        min-height: 460px;
+      }
+
+      .signal {
+        grid-template-columns: 1fr;
+      }
+
+      .section-head {
+        display: block;
+      }
+
+      .section-note {
+        margin-top: 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="scanline"></div>
+  <div class="page">
+    <nav class="nav">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <span>微众钱包 · 智能风控客户经理</span>
+      </div>
+      <div class="nav-links">
+        <a href="#overview">项目定位</a>
+        <a href="#features">现有功能</a>
+        <a href="#flow">业务流程</a>
+        <a href="#value">项目价值</a>
+      </div>
+    </nav>
+
+    <main>
+      <section class="hero" id="overview">
+        <div>
+          <div class="eyebrow"><span class="pulse"></span> 小微企业贷款场景 · 风控感知 Agent</div>
+          <h1><span class="title-gradient">让客户经理 Agent</span><br />在对话中形成风控判断</h1>
+          <p class="lead">
+            本项目面向小微企业经营贷咨询场景，打造一个懂产品、懂流程、懂风险边界的智能客户经理。
+            它不只是回答问题，还能在自然沟通中持续采集客户经营信息、识别风险信号、沉淀风控画像，并引导客户完成材料准备。
+          </p>
+          <div class="hero-actions">
+            <a class="button" href="#features">查看核心能力</a>
+            <a class="button secondary" href="#demo">查看演示亮点</a>
+          </div>
+          <div class="metric-row">
+            <div class="metric">
+              <strong>100</strong>
+              <span>轮连续对话测试，覆盖完整贷前沟通链路</span>
+            </div>
+            <div class="metric">
+              <strong>12</strong>
+              <span>项核心能力，覆盖对话、材料、图片、财务和风控</span>
+            </div>
+            <div class="metric">
+              <strong>35+</strong>
+              <span>类风险与欺诈场景沉淀，辅助识别异常线索</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="visual" aria-label="科技风风控雷达">
+          <div class="hud-title">
+            <span>RISK INTELLIGENCE PANEL</span>
+            <span>STATUS · ACTIVE</span>
+          </div>
+          <div class="radar">
+            <span class="node n1"></span>
+            <span class="node n2"></span>
+            <span class="node n3"></span>
+            <span class="node n4"></span>
+          </div>
+          <div class="hud-card">
+            <div class="signal">
+              <span>经营真实性</span>
+              <div class="bar"><i style="width: 88%"></i></div>
+              <span>88%</span>
+            </div>
+            <div class="signal">
+              <span>还款来源</span>
+              <div class="bar"><i style="width: 76%"></i></div>
+              <span>76%</span>
+            </div>
+            <div class="signal">
+              <span>材料完整度</span>
+              <div class="bar"><i style="width: 64%"></i></div>
+              <span>64%</span>
+            </div>
+            <div class="signal">
+              <span>合规边界</span>
+              <div class="bar"><i style="width: 94%"></i></div>
+              <span>94%</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="features">
+        <div class="section-head">
+          <div>
+            <div class="kicker">CURRENT CAPABILITIES</div>
+            <h2>现有功能</h2>
+          </div>
+          <p class="section-note">
+            系统围绕真实贷款咨询场景设计，覆盖对话、材料、图片、财务、钱包流水和风控画像，让分散信息变成可追踪、可核验、可继续推进的业务资产。
+          </p>
+        </div>
+
+        <div class="grid four">
+          <article class="card">
+            <div class="card-number">01 / 智能贷款咨询</div>
+            <h3>懂业务的客户经理</h3>
+            <p>围绕额度、利率、期限、申请流程、还款方式、材料准备等高频问题进行自然解答，表达方式接近真实客户经理，而不是机械问答。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">02 / 风控信息采集</div>
+            <h3>边聊天边识别关键事实</h3>
+            <p>在对话中逐步了解客户身份、企业经营、资金用途、上下游客户、现金流、资产负债和还款来源，形成完整贷前信息链。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">03 / 风险画像沉淀</div>
+            <h3>自动更新客户档案</h3>
+            <p>支持将多轮对话沉淀为企业风控画像，记录客户基本信息、融资需求、经营情况、风险信号、待核验材料和下一步行动。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">04 / 图片材料识别</div>
+            <h3>支持图片上传与理解</h3>
+            <p>客户可上传营业执照、流水截图、合同、报价单、库存照片等材料，系统把图片作为对话依据，辅助判断材料内容和贷款场景。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">05 / 图片历史召回</div>
+            <h3>自动比对历史图档</h3>
+            <p>同一企业过往上传的图片会形成历史图档库。客户再次上传相似材料时，系统可召回历史图片，辅助发现日期、金额、抬头、交易方等前后不一致。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">06 / 信息变更审计</div>
+            <h3>不是简单覆盖旧答案</h3>
+            <p>当客户修正注册年限、营业额、租金、额度等关键字段时，系统保留前后版本和解释，提示后续用材料核验，降低误判风险。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">07 / 财务协助</div>
+            <h3>辅助梳理经营数据</h3>
+            <p>围绕收入、支出、利润、应收账款、固定成本、工资、租金等信息，帮助客户把口头经营情况整理成更清晰的财务口径。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">08 / 钱包分析</div>
+            <h3>流水收支一屏看清</h3>
+            <p>支持记录和分析企业钱包流水，展示收入、支出、净现金流、月度趋势和经营储备建议，为贷款额度和还款能力判断提供辅助参考。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">09 / 材料上传卡片</div>
+            <h3>把“要材料”变成行动</h3>
+            <p>当对话里出现需要核验的金额、合同、流水、纳税、社保、回款方等信息时，系统可生成材料上传卡片，引导客户补齐关键证明。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">10 / 语音情绪感知</div>
+            <h3>根据客户状态调整节奏</h3>
+            <p>支持接收语音输入并识别情绪倾向。客户紧张、不满或犹豫时，客户经理回复会自动放缓节奏，减少追问压迫感。</p>
+          </article>
+
+          <article class="card wide">
+            <div class="card-number">11 / 本地知识库增强</div>
+            <h3>产品、流程、材料、话术、行业案例一体化</h3>
+            <p>项目内置微业贷产品知识、准入条件、材料清单、申请流程、常见问题、风控口径、行业场景和欺诈案例，让回答更稳定、更贴近金融业务语境。</p>
+          </article>
+
+          <article class="card">
+            <div class="card-number">12 / 合规边界控制</div>
+            <h3>知道什么不能说</h3>
+            <p>避免承诺一定放款、最低利率、加急通过，不诱导客户包装材料，不引导经营贷流入购房、炒股、还旧贷等违规用途。</p>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <div>
+            <div class="kicker">CAPABILITY MATRIX</div>
+            <h2>全景能力矩阵</h2>
+          </div>
+          <p class="section-note">
+            项目不是单一聊天窗口，而是把客户经理、风控助理、材料助理和财务助理组合在同一个业务工作台里。
+          </p>
+        </div>
+
+        <div class="grid four">
+          <article class="card">
+            <div class="card-number">客户侧</div>
+            <h3>自然沟通</h3>
+            <div class="mini-list">
+              <span>贷款咨询与流程解答</span>
+              <span>资料准备与上传引导</span>
+              <span>语音、图片、文字多入口</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-number">材料侧</div>
+            <h3>多模态核验</h3>
+            <div class="mini-list">
+              <span>图片材料理解</span>
+              <span>历史图片召回</span>
+              <span>前后版本差异追问</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-number">财务侧</div>
+            <h3>经营辅助分析</h3>
+            <div class="mini-list">
+              <span>收入支出整理</span>
+              <span>现金流与利润口径</span>
+              <span>钱包流水摘要与趋势</span>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-number">风控侧</div>
+            <h3>贷前风险闭环</h3>
+            <div class="mini-list">
+              <span>风险画像自动更新</span>
+              <span>字段变更审计</span>
+              <span>合规红线与风险提醒</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="flow">
+        <div class="section-head">
+          <div>
+            <div class="kicker">BUSINESS LOOP</div>
+            <h2>从咨询到核验的完整闭环</h2>
+          </div>
+          <p class="section-note">
+            项目把客户经理的核心工作拆成连续流程：接待、理解、材料核验、财务分析、风险沉淀，让智能体更像业务助手，而不是单点工具。
+          </p>
+        </div>
+
+        <div class="flow">
+          <div class="step">
+            <h3>客户咨询</h3>
+            <p>客户提出经营贷、额度、利率、流程等问题，系统用清晰口径完成初步接待。</p>
+          </div>
+          <div class="step">
+            <h3>经营了解</h3>
+            <p>围绕行业、年限、营收、客户、账期、租金、库存等信息进行自然追问。</p>
+          </div>
+          <div class="step">
+            <h3>风险判断</h3>
+            <p>关注资金用途、还款来源、负债水平、材料真实性和异常变更。</p>
+          </div>
+          <div class="step">
+            <h3>材料核验</h3>
+            <p>引导上传营业执照、流水、合同、报价单等材料，并结合历史图档做前后比对。</p>
+          </div>
+          <div class="step">
+            <h3>财务画像</h3>
+            <p>结合钱包流水、收入支出、月度趋势和经营储备，辅助判断还款能力。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="demo">
+        <div class="section-head">
+          <div>
+            <div class="kicker">DEMO HIGHLIGHTS</div>
+            <h2>演示亮点</h2>
+          </div>
+          <p class="section-note">
+            演示时可以重点展示“对话推进 + 图片材料 + 钱包分析 + 画像更新”的综合效果：左侧是客户自然咨询，右侧是系统沉淀出的业务判断。
+          </p>
+        </div>
+
+        <div class="showcase">
+          <div class="terminal">
+            <div class="terminal-top">
+              <span class="dot"></span>
+              <span class="dot"></span>
+              <span class="dot"></span>
+            </div>
+            <div class="dialogue">
+              <div class="bubble">客户：我在深圳做电子元器件贸易，想贷 120 万备货，报价单和流水截图我也发你。</div>
+              <div class="bubble agent">客户经理：我先帮您看经营情况。请问公司经营多久、下游回款周期大概多少？</div>
+              <div class="bubble">客户：公司做了快 10 年，下游一般 45 天回款，上个月钱包流水也可以一起看。</div>
+              <div class="bubble agent">客户经理：这个账期在贸易行业比较常见。我会结合您上传的材料、历史图档和流水收支，先看经营真实性、资金用途和还款来源是否匹配。</div>
+            </div>
+          </div>
+
+          <aside class="profile">
+            <h3>智能业务面板</h3>
+            <div class="profile-row"><span>企业类型</span><strong>小微贸易企业</strong></div>
+            <div class="profile-row"><span>主营业务</span><strong>电子元器件批发</strong></div>
+            <div class="profile-row"><span>贷款需求</span><strong>120 万经营周转</strong></div>
+            <div class="profile-row"><span>资金用途</span><strong>旺季备货采购</strong></div>
+            <div class="profile-row"><span>图片材料</span><strong>报价单 / 流水截图</strong></div>
+            <div class="profile-row"><span>图档召回</span><strong>比对历史上传材料</strong></div>
+            <div class="profile-row"><span>钱包分析</span><strong>收入 / 支出 / 净现金流</strong></div>
+            <div class="profile-row"><span>当前风险</span><strong><span class="risk">LOW</span></strong></div>
+            <div class="profile-row"><span>待核验材料</span><strong>纳税 / 合同 / 回款记录</strong></div>
+            <div class="profile-row"><span>下一步</span><strong>启动预审材料收集</strong></div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="value">
+        <div class="quote">
+          <p>这个项目的核心不是“让 AI 会聊天”，而是让 AI 在长对话中持续形成金融业务判断。</p>
+          <span>
+            它把客户咨询、产品知识、风控意识、材料核验和客户画像连接成一个闭环。
+            对外表现是一个自然专业的客户经理，对内沉淀的是可追踪、可复盘、可核验的风控线索。
+          </span>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      微众钱包项目介绍 · 智能风控客户经理 Agent · 面向小微企业经营贷咨询与贷前信息采集场景
+    </footer>
+  </div>
+</body>
+</html>
