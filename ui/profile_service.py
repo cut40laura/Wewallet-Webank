@@ -919,6 +919,80 @@ def load_loan_estimate(enterprise_id: str) -> dict[str, Any] | None:
     return saved if isinstance(saved, dict) else None
 
 
+def rule_based_loan_estimate(profile_markdown: str, summary: dict[str, Any]) -> dict[str, Any]:
+    """Conservative fallback used when the model-backed loan engine times out.
+
+    This keeps the product surface usable in demos while making it explicit
+    that the result is a preliminary estimate based only on local records.
+    """
+    tx_count = int(summary.get("transaction_count") or 0)
+    plan = summary.get("plan", {}) if isinstance(summary, dict) else {}
+    avg_income = float(plan.get("avg_monthly_income") or 0)
+    avg_expense = float(plan.get("avg_monthly_expense") or 0)
+    net = float(summary.get("net") or 0)
+
+    if tx_count <= 0 or avg_income <= 0:
+        return {
+            "insufficient": True,
+            "insufficient_hint": "暂时还不够给出额度，先补充近 6 个月流水或和小微聊聊经营情况吧。",
+            "grade": "C",
+            "grade_label": _GRADE_LABELS["C"],
+            "amount_min": 0.0,
+            "amount_max": 0.0,
+            "rate_min": 0.0,
+            "rate_max": 0.0,
+            "term_max_months": 0,
+            "reasons": [],
+            "missing_materials": [{"name": "近6个月流水", "impact": "用于初步测算额度"}],
+            "disclaimer": "预估结果，最终以实际审批为准。",
+            "fallback": True,
+        }
+
+    margin = (avg_income - avg_expense) / max(avg_income, 1.0)
+    income_wan = avg_income / 10000.0
+    net_wan = max(net, 0.0) / 10000.0
+    amount_max = round(max(5.0, min(80.0, income_wan * 2.4 + net_wan * 0.25)), 1)
+    amount_min = round(max(3.0, amount_max * 0.55), 1)
+
+    if tx_count >= 6 and margin >= 0.45:
+        grade, rate_min, rate_max = "B", 7.2, 10.5
+    elif tx_count >= 3 and margin >= 0.2:
+        grade, rate_min, rate_max = "C", 8.5, 12.8
+    else:
+        grade, rate_min, rate_max = "D", 10.8, 15.0
+        amount_max = round(min(amount_max, 20.0), 1)
+        amount_min = round(min(amount_min, amount_max), 1)
+
+    reasons = [
+        f"近 {max(1, len(summary.get('months') or []))} 个月有连续流水",
+        f"月均收入约 {income_wan:.1f} 万",
+    ]
+    if net > 0:
+        reasons.append("账面净流入为正")
+    if "待核验" in profile_markdown:
+        reasons.append("部分材料仍需补齐")
+
+    return {
+        "insufficient": False,
+        "insufficient_hint": "",
+        "grade": grade,
+        "grade_label": _GRADE_LABELS[grade],
+        "amount_min": amount_min,
+        "amount_max": amount_max,
+        "rate_min": rate_min,
+        "rate_max": rate_max,
+        "term_max_months": 12 if grade == "D" else 24,
+        "reasons": reasons[:4],
+        "missing_materials": [
+            {"name": "近6个月流水", "impact": "可提高额度可信度"},
+            {"name": "订单合同", "impact": "证明真实资金用途"},
+            {"name": "纳税记录", "impact": "有助于降低利率"},
+        ],
+        "disclaimer": "预估结果，最终以实际审批为准；当前为系统保守测算。",
+        "fallback": True,
+    }
+
+
 def run_loan_estimate(enterprise_id: str, enterprise: dict[str, Any]) -> dict[str, Any]:
     """Re-evaluate the loan limit: feed the risk profile + wallet summary to the
     gateway, parse a structured authorization plan, and persist it as the new
@@ -933,9 +1007,12 @@ def run_loan_estimate(enterprise_id: str, enterprise: dict[str, Any]) -> dict[st
             build_loan_estimate_prompt(markdown, summary, enterprise),
             timeout=45.0,
         )
+        estimate = parse_loan_estimate(str(result.get("content") or ""))
+    except (RuntimeError, TimeoutError) as exc:
+        estimate = rule_based_loan_estimate(markdown, summary)
+        estimate["fallback_reason"] = str(exc)[:160]
     finally:
         gateway.reset_session(session_name)
-    estimate = parse_loan_estimate(str(result.get("content") or ""))
     estimate["generated_at"] = iso_now()
     save_json_file(enterprise_loan_estimate_file(enterprise_id), estimate)
     return estimate
