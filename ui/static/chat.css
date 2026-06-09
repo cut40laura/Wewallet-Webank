@@ -3707,6 +3707,63 @@ button {
   pointer-events: none;
 }
 
+/* 小微"在场"光球：接通中=微弱、在听=缓慢呼吸、在说=随音量脉动发光、看材料=青色扫描 */
+.vc-orb {
+  --vc-level: 0;               /* 0~1，说话时由 JS 按播放音量实时写入 */
+  position: relative;
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  place-items: center;
+  pointer-events: none;
+  transition: transform 90ms ease-out;
+  display: none;              /* 隐藏小微"在场"光球（避免遮挡画面）；状态逻辑不受影响 */
+}
+.vc-orb::before {             /* 外圈光晕 */
+  content: "";
+  position: absolute;
+  inset: -18px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(80, 170, 255, 0.45), rgba(80, 170, 255, 0) 70%);
+  opacity: 0.5;
+  transition: opacity 160ms ease-out;
+}
+.vc-orb-core {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 38% 32%, #eaf4ff 0%, #7cc0ff 42%, #3f8ff0 100%);
+  box-shadow: 0 8px 30px rgba(40, 120, 220, 0.4), inset 0 2px 10px rgba(255, 255, 255, 0.5);
+  transition: transform 90ms ease-out, box-shadow 160ms ease-out;
+}
+/* 接通中：暗淡、慢脉动 */
+.vc-orb.is-connecting { opacity: 0.65; }
+.vc-orb.is-connecting .vc-orb-core { animation: vc-orb-breathe 2.6s ease-in-out infinite; filter: saturate(0.7); }
+/* 在听：缓慢呼吸 */
+.vc-orb.is-listening .vc-orb-core { animation: vc-orb-breathe 3.4s ease-in-out infinite; }
+.vc-orb.is-listening::before { opacity: 0.35; }
+/* 在说：随音量脉动 + 更亮的光晕（不跑呼吸动画，交给 --vc-level） */
+.vc-orb.is-speaking .vc-orb-core {
+  animation: none;
+  transform: scale(calc(1 + var(--vc-level) * 0.34));
+  box-shadow: 0 10px 40px rgba(60, 150, 255, calc(0.4 + var(--vc-level) * 0.4)),
+              inset 0 2px 12px rgba(255, 255, 255, 0.6);
+}
+.vc-orb.is-speaking::before { opacity: calc(0.45 + var(--vc-level) * 0.45); }
+/* 看材料：青绿色调，慢扫描 */
+.vc-orb.is-vision .vc-orb-core {
+  background: radial-gradient(circle at 38% 32%, #eafff6 0%, #5fe0c0 45%, #18b48f 100%);
+  animation: vc-orb-breathe 1.4s ease-in-out infinite;
+}
+.vc-orb.is-vision::before { background: radial-gradient(circle, rgba(40, 220, 180, 0.5), rgba(40, 220, 180, 0) 70%); opacity: 0.6; }
+@keyframes vc-orb-breathe {
+  0%, 100% { transform: scale(0.94); opacity: 0.9; }
+  50% { transform: scale(1.05); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vc-orb-core { animation: none !important; }
+}
+
 .video-call-listening { display: flex; gap: 7px; }
 .video-call-listening span {
   width: 9px;
@@ -3724,13 +3781,22 @@ button {
 
 .video-call-caption {
   margin: 0;
-  max-width: 92%;
+  max-width: 88%;
   text-align: center;
-  font-size: 15px;
-  line-height: 1.5;
+  font-size: 17px;
+  line-height: 1.55;
   color: #fff;
-  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.55);
+  padding: 11px 18px;
+  border-radius: 18px;
+  background: rgba(20, 22, 28, 0.52);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  opacity: 1;
+  transition: opacity 0.55s ease-out;
 }
+.video-call-caption.is-fading { opacity: 0; }
 
 .video-call-dock {
   position: absolute;

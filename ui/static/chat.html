@@ -332,8 +332,11 @@
         <button id="closeVideoCallButton" class="video-call-close" type="button" aria-label="关闭视频通话">×</button>
       </header>
 
-      <!-- 中部：聆听指示 + 字幕 -->
+      <!-- 中部：小微"在场"光球 + 聆听指示 + 字幕 -->
       <div class="video-call-center">
+        <div id="videoCallOrb" class="vc-orb is-connecting" aria-hidden="true">
+          <span class="vc-orb-core"></span>
+        </div>
         <div id="videoCallListening" class="video-call-listening" aria-hidden="true"><span></span><span></span><span></span></div>
         <p id="videoCallCaption" class="video-call-caption" hidden></p>
       </div>
@@ -346,12 +349,6 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
             </span>
             <span class="vc-btn-label">静音</span>
-          </button>
-          <button id="videoCallShowDocButton" class="vc-btn" type="button" aria-label="给小微看材料" disabled>
-            <span class="vc-ico" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="13" y2="16"/></svg>
-            </span>
-            <span class="vc-btn-label">看材料</span>
           </button>
           <button id="videoCallStartButton" class="vc-btn vc-btn-camera" type="button" aria-label="摄像头开关">
             <span class="vc-ico" aria-hidden="true">

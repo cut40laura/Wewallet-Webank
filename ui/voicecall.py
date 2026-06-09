@@ -191,13 +191,14 @@ _VISION_STRUCTURED_PROMPT = (
     '{"place_type":"办公室|居住/家|店铺|工厂/车间|户外|车内|会议室|其他|看不清",'
     '"person_present":true/false,"person_count":数字,'
     '"looking_off_screen":true/false,'  # 是否频繁瞟别处/疑似照稿念
+    '"person_desc":"有人物时，简述画面里这个人【确实看得清的】外观：性别、大致年龄段、发型、衣着颜色款式、戴没戴眼镜/帽子、表情或姿态；没人或看不清就空字符串。绝不猜测、绝不编造",'
     '"visible_documents":["证件/执照/合同/流水等，看不清就空数组"],'
     '"document_text":"证件/单据上能读到的关键字（名称、日期、金额、公司抬头等），读不到就空字符串",'
     '"notable_objects":["显著物品/商品/设备"],'
     # 关键：判"与**常规**经营/营业场所不符"（看图就能判），不是"与所述不符"（你看不到对话、判不了）。
     '"anomalies":["与常规经营/营业场所明显不符之处（如不像做生意的地方、像卧室/车内/空无一人），没有就空数组"],'
-    '"caption":"一句话客观描述这帧画面，**30字以内**"}'
-    "\n要求：直接只输出这个 JSON，不要思考过程、不要解释；每个数组最多列 3 项；caption 简短。"
+    '"caption":"一句话客观描述这帧画面：画面里**有人就先简述这个人**（性别、大致年龄段、发型、衣着等确实看得清的），再带场景；没人就只说场景。40字以内"}'
+    "\n要求：直接只输出这个 JSON，不要思考过程、不要解释；每个数组最多列 3 项；caption 控制在 40 字内。"
 )
 
 
@@ -238,8 +239,9 @@ def _parse_observation(raw: str) -> dict[str, Any] | None:
     for key in ("visible_documents", "notable_objects", "anomalies"):
         if not isinstance(data.get(key), list):
             data[key] = []
-    if not isinstance(data.get("document_text"), str):
-        data["document_text"] = ""
+    for key in ("document_text", "person_desc"):
+        if not isinstance(data.get(key), str):
+            data[key] = ""
     return data
 
 

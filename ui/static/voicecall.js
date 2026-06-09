@@ -9,8 +9,8 @@
  *      麦克风 → PCM16/16kHz → WebSocket 中继(/api/voicecall/realtime-config 给地址) → 上游 →
  *      回传 PCM16/24kHz 音频边收边放 + 字幕。服务端 VAD 自动断句、可打断。
  *      ⚠️ 采集 16kHz、播放 24kHz（豆包 ASR 收 16k、TTS 出 24k），故用两个 AudioContext。
- *      看材料：截一帧发 {type:"vision.frame"}，中继调多模态视觉描述后注入会话，
- *      小微当场"看到并转述"。
+ *      看画面：每轮你一开口就静默截一帧发 {type:"vision.frame"}，中继调多模态视觉描述后
+ *      注入会话，小微"边看边聊"（无需手动按钮）。
  *   2) placeholder（回落）：浏览器原生 Web Speech API 做 STT/TTS（无 STEP_API_KEY 或
  *      浏览器不支持时）。即旧版形态。
  *
@@ -26,10 +26,10 @@
   const talkButton = document.getElementById("videoCallTalkButton");
   const startButton = document.getElementById("videoCallStartButton"); // 现作"摄像头开关"
   const muteButton = document.getElementById("videoCallMuteButton");
-  const showDocButton = document.getElementById("videoCallShowDocButton");
   const endButton = document.getElementById("videoCallEndButton");
   const closeButton = document.getElementById("closeVideoCallButton");
   const listeningEl = document.getElementById("videoCallListening");
+  const orbEl = document.getElementById("videoCallOrb");
   const backdrop = document.getElementById("videoCallBackdrop");
 
   if (!talkButton) return; // 没有按钮就不挂（防御）
@@ -49,14 +49,36 @@
     if (statusEl) statusEl.textContent = text;
   }
 
+  let captionHideTimer = null;
   function showCaption(text) {
     if (!caption) return;
+    if (captionHideTimer) { clearTimeout(captionHideTimer); captionHideTimer = null; }
+    caption.classList.remove("is-fading");
     caption.textContent = text || "";
     caption.hidden = !text;
   }
+  // 说完一句后让字幕淡出（先渐隐再隐藏），别一直压在画面上。
+  function fadeCaptionSoon() {
+    if (!caption || caption.hidden) return;
+    if (captionHideTimer) clearTimeout(captionHideTimer);
+    captionHideTimer = setTimeout(() => {
+      caption.classList.add("is-fading");
+      captionHideTimer = setTimeout(() => {
+        caption.hidden = true;
+        caption.classList.remove("is-fading");
+        caption.textContent = "";
+      }, 600);
+    }, 2600);
+  }
 
-  function setShowDocEnabled(on) {
-    if (showDocButton) showDocButton.disabled = !on;
+  // 通话状态 → 光球外观 + 聆听点显隐。state: connecting|listening|speaking|null
+  function setCallState(state) {
+    if (orbEl) orbEl.className = "vc-orb" + (state ? " is-" + state : "");
+    if (listeningEl) listeningEl.style.visibility = state === "listening" ? "visible" : "hidden";
+  }
+  // 说话时由播放音量实时驱动光球脉动（0~1）。
+  function setOrbLevel(level) {
+    if (orbEl) orbEl.style.setProperty("--vc-level", String(Math.max(0, Math.min(1, level)) || 0));
   }
 
   function setListening(on) {
@@ -166,6 +188,8 @@
     let playCtx = null; // TTS 播放上下文（24kHz）
     let micSource = null;
     let workletNode = null; // PCM 采集 worklet 节点（取代已废弃的 ScriptProcessor）
+    let analyser = null; // 接在播放链路上，实时取小微声音的音量驱动光球脉动
+    let levelRAF = 0; // requestAnimationFrame 句柄
     let nextPlayTime = 0; // 播放调度游标
     const sources = new Set(); // 已排期的播放节点，便于打断时停掉
     let selfCaption = ""; // 小微当前句子字幕累积
@@ -192,7 +216,7 @@
       if (!frame) return;
       lastAutoVision = now;
       visionBusy = true;
-      ws.send(JSON.stringify({ type: "vision.frame", frame, auto: true }));
+      ws.send(JSON.stringify({ type: "vision.frame", frame }));
     }
 
     function stopPlayback() {
@@ -204,13 +228,24 @@
       aiSpeakingUntil = 0; // 已停播，立刻恢复正常上传麦克风
     }
 
+    // 用播放链路上的 analyser 实时取音量 → 驱动光球脉动（比逐块算 RMS 更平滑、连续）。
+    function pollLevel() {
+      if (!analyser) return;
+      const buf = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(buf);
+      let s = 0;
+      for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; s += v * v; }
+      setOrbLevel(Math.min(1, Math.sqrt(s / buf.length) * 3.2));
+      levelRAF = requestAnimationFrame(pollLevel);
+    }
+
     function playDelta(f32) {
       if (!playCtx || !f32.length) return;
       const buf = playCtx.createBuffer(1, f32.length, PLAYBACK_RATE);
       buf.copyToChannel(f32, 0);
       const src = playCtx.createBufferSource();
       src.buffer = buf;
-      src.connect(playCtx.destination);
+      src.connect(analyser || playCtx.destination); // 经 analyser 再到扬声器，便于取音量
       const now = playCtx.currentTime;
       if (nextPlayTime < now) nextPlayTime = now;
       src.start(nextPlayTime);
@@ -226,11 +261,13 @@
         case "input_audio_buffer.speech_started":
           // 客户开口 → 打断小微正在播的话（barge-in）+ 顺手截一帧让她"看到"当前画面。
           stopPlayback();
+          setCallState("listening");
+          setOrbLevel(0);
           setStatus("在听您说...");
           autoVision();
           break;
         case "response.audio.delta":
-          if (ev.delta) playDelta(base64ToFloat32(ev.delta));
+          if (ev.delta) { setCallState("speaking"); playDelta(base64ToFloat32(ev.delta)); }
           break;
         case "response.audio_transcript.delta":
           gotSubtitle = true;
@@ -254,14 +291,16 @@
           // 一轮回复结束：清字幕累积，下一轮重新开始（豆包无 audio_transcript.done）。
           selfCaption = "";
           gotSubtitle = false;
+          setCallState("listening");
+          setOrbLevel(0);
+          fadeCaptionSoon();
           break;
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript) setStatus("我：" + ev.transcript);
           break;
         case "vision.described":
+          // 每轮自动看画面是静默的：只复位单飞闸门，让下一轮可以再看；不打扰字幕/状态。
           visionBusy = false;
-          // 自动看画面是静默的，不打扰字幕/状态；只有手动"看材料"才提示。
-          if (!ev.auto) setStatus("小微看了看材料...");
           break;
         case "error":
           setStatus("出错了：" + (ev.error?.message || ev.message || "未知"));
@@ -277,13 +316,19 @@
       playCtx = new Ctx({ sampleRate: PLAYBACK_RATE });
       if (captureCtx.state === "suspended") await captureCtx.resume();
       if (playCtx.state === "suspended") await playCtx.resume();
+      // 播放链路上接 analyser 取小微声音的实时音量（驱动光球脉动），再接到扬声器。
+      analyser = playCtx.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.6;
+      analyser.connect(playCtx.destination);
+      pollLevel();
       // worklet 模块必须在建节点前加载好（异步）。
       await captureCtx.audioWorklet.addModule("/static/audio-worklet/pcm-recorder.js");
 
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {
         setStatus("通话已接通，请直接说话，小微在听...");
-        setShowDocEnabled(true);
+        setCallState("listening");
         // 麦克风采集（worklet 音频线程）→ PCM16 块 → input_audio_buffer.append
         micSource = captureCtx.createMediaStreamSource(stream);
         workletNode = new AudioWorkletNode(captureCtx, "pcm-recorder");
@@ -326,16 +371,10 @@
       ws.onclose = () => { if (call.active) setStatus("连接已断开。"); };
     }
 
-    function showDocument() {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const frame = captureFrame();
-      if (!frame) { setStatus("画面还没准备好，请稍等。"); return; }
-      setStatus("正在把材料给小微看...");
-      ws.send(JSON.stringify({ type: "vision.frame", frame }));
-    }
-
     function stop() {
       stopPlayback();
+      if (levelRAF) { cancelAnimationFrame(levelRAF); levelRAF = 0; }
+      analyser = null;
       try { workletNode && workletNode.disconnect(); } catch (e) {}
       try { micSource && micSource.disconnect(); } catch (e) {}
       if (workletNode) workletNode.port.onmessage = null;
@@ -355,7 +394,7 @@
       }
     }
 
-    return { start, stop, showDocument };
+    return { start, stop };
   }
 
   // ════════════════════════════════════════════════════════════════════════
@@ -399,9 +438,15 @@
         showCaption("小微：" + reply);
         state.speaking = true;
         pauseRecognition();
+        // 占位模式拿不到逐帧音量，用轻量起伏让光球"说话"时有动静。
+        setCallState("speaking");
+        let t = 0;
+        const wiggle = setInterval(() => { t += 0.3; setOrbLevel(0.3 + 0.3 * Math.abs(Math.sin(t))); }, 110);
         await speak(reply);
+        clearInterval(wiggle);
+        setOrbLevel(0);
         state.speaking = false;
-        if (call.active) { setStatus("请说话，小微在听..."); startRecognition(); }
+        if (call.active) { setStatus("请说话，小微在听..."); setCallState("listening"); fadeCaptionSoon(); startRecognition(); }
       } catch (e) {
         setStatus("网络好像有点慢：" + (e.message || e));
       } finally {
@@ -449,8 +494,8 @@
     async function start() {
       if (!SpeechRecognition) throw new Error("当前浏览器不支持语音识别（建议用 Chrome/Edge）。");
       await ensureStream();
-      setShowDocEnabled(false); // 占位模式每轮自动截帧，无需手动按钮
       setStatus("通话已开始，请直接说话，小微在听...");
+      setCallState("listening");
       sendTurn("（通话刚接通，请用一句话热情地跟客户打招呼并自我介绍）");
       startRecognition();
     }
@@ -462,9 +507,7 @@
       if (window.speechSynthesis) window.speechSynthesis.cancel();
     }
 
-    function showDocument() { /* 占位模式不需要：每轮自动带画面 */ }
-
-    return { start, stop, showDocument };
+    return { start, stop };
   }
 
   // ── 通话生命周期 ─────────────────────────────────────────────────────────
@@ -500,6 +543,7 @@
     if (muteButton) muteButton.disabled = false;
     showCaption("");
     setStatus("正在接通…");
+    setCallState("connecting");
     setListening(true);
 
     const cfg = await fetchBackend();
@@ -519,6 +563,8 @@
     if (!call.active && !call.stream && !call.engine) return;
     call.active = false;
     setListening(false);
+    setCallState(null);
+    setOrbLevel(0);
     if (call.engine) { try { call.engine.stop(); } catch (e) {} call.engine = null; }
     // 只关我们自己开的流；chat.js 开的留给它管。
     if (call.stream) {
@@ -527,7 +573,6 @@
       if (selfVideo) selfVideo.srcObject = null;
     }
     talkButton.textContent = "和小微对话";
-    setShowDocEnabled(false);
     if (muteButton) {
       muteButton.disabled = true;
       muteButton.classList.remove("is-active");
@@ -558,12 +603,6 @@
     if (call.active) stopCall();
     else startCall();
   });
-
-  if (showDocButton) {
-    showDocButton.addEventListener("click", () => {
-      if (call.active && call.engine) call.engine.showDocument();
-    });
-  }
 
   // 接管"摄像头开关"和"静音"（覆盖 chat.js 的 onclick，避免重复开流/空操作）。
   if (startButton) startButton.onclick = toggleCamera;
