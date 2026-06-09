@@ -286,16 +286,17 @@ class HermesTuiGateway:
 
             event_type = str(event.get("type") or "")
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            if event_callback:
-                event_callback(event_type, payload)
 
             if event_type in {"thinking.delta", "reasoning.delta"}:
                 text = str(payload.get("text") or "")
-                if text:
-                    thinking_parts.append(text)
-                    if is_thinking_status(text):
-                        progress.append({"type": event_type, "text": text, "name": "Hermes"})
-            elif event_type == "message.delta":
+                if text and is_thinking_status(text):
+                    progress.append({"type": event_type, "text": text, "name": "Hermes"})
+                continue
+
+            if event_callback:
+                event_callback(event_type, payload)
+
+            if event_type == "message.delta":
                 text = str(payload.get("text") or "")
                 if text:
                     content_parts.append(text)
@@ -324,14 +325,10 @@ class HermesTuiGateway:
             raise TimeoutError(self._gateway_error("智能体回复超时"))
 
         visible = final_text or "".join(content_parts)
-        visible, inline_thinking = split_reasoning(visible)
-        if inline_thinking:
-            thinking_parts.append(inline_thinking)
-        if final_reasoning:
-            thinking_parts.append(final_reasoning)
+        visible, _inline_thinking = split_reasoning(visible)
         return {
             "content": sanitize_model_output(visible),
-            "thinking": "\n\n".join(part.strip() for part in thinking_parts if part and part.strip()).strip(),
+            "thinking": "",
             "progress": progress[-120:],
             "inline_diffs": inline_diffs[-20:],
             "raw": {"session_id": sid},
