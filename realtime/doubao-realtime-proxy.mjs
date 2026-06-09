@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,10 @@ try {
 
 const PORT = Number(process.env.DOUBAO_REALTIME_PROXY_PORT || 8870);
 const HOST = process.env.DOUBAO_REALTIME_PROXY_HOST || "127.0.0.1";
+// TLS（wss/https）：当页面经 HTTPS 打开时，浏览器禁止从中连 ws://（mixed-content），
+// 因此对外暴露的代理也必须是 wss。提供证书/私钥路径即启用 TLS；本地开发留空走 http/ws。
+const TLS_CERT_PATH = process.env.DOUBAO_REALTIME_PROXY_TLS_CERT || "";
+const TLS_KEY_PATH = process.env.DOUBAO_REALTIME_PROXY_TLS_KEY || "";
 const API_KEY = process.env.DOUBAO_REALTIME_API_KEY || "";
 const APP_ID = process.env.DOUBAO_REALTIME_APP_ID || "";
 const ACCESS_KEY = process.env.DOUBAO_REALTIME_ACCESS_KEY || "";
@@ -75,7 +80,9 @@ const EVENT_RECEIVE = {
   DialogCommonError: 599
 };
 
-const server = http.createServer((req, res) => {
+// 启用 TLS 时用 https.createServer（wss），否则普通 http（本地开发）。
+const TLS_ENABLED = Boolean(TLS_CERT_PATH && TLS_KEY_PATH);
+const requestHandler = (req, res) => {
   // 浏览器从 Python(UI 端口) 调本代理(:8870) 是跨域，统一放行
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -111,7 +118,15 @@ const server = http.createServer((req, res) => {
     credential_mode: APP_ID && ACCESS_KEY ? "app-id-access-key" : API_KEY ? "api-key" : "mock",
     path: "/v1/realtime-voice/stream"
   });
-});
+};
+
+// 有证书则起 https（wss），否则普通 http（本地开发）。
+const server = TLS_ENABLED
+  ? https.createServer(
+      { cert: readFileSync(TLS_CERT_PATH), key: readFileSync(TLS_KEY_PATH) },
+      requestHandler,
+    )
+  : http.createServer(requestHandler);
 
 const wss = new WebSocketServer({ server, path: "/v1/realtime-voice/stream" });
 
@@ -267,7 +282,7 @@ wss.on("connection", (client, request) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Doubao realtime proxy listening on ws://${HOST}:${PORT}/v1/realtime-voice/stream`);
+  console.log(`Doubao realtime proxy listening on ${TLS_ENABLED ? "wss" : "ws"}://${HOST}:${PORT}/v1/realtime-voice/stream`);
 });
 
 // ============ 视频通话·视觉理解 /api/vision（豆包 ARK → Qwen 降级 → mock） ============

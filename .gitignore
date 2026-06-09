@@ -39,6 +39,9 @@ app_data/
 runtime/
 .env
 
+# TLS 证书/私钥（在服务器上生成，绝不提交）
+deploy/certs/
+
 # 模拟器产物（保留代码与画像，忽略运行输出）
 simulator/logs/
 simulator/memory/

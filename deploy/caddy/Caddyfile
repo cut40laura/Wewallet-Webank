@@ -1,0 +1,20 @@
+# 站点域名来自环境变量 WEWALLET_SITE_DOMAIN（默认 sslip.io 免费域名）。
+# Caddy 会自动为该域名申请并续期 Let's Encrypt 证书，自动把 80 跳转到 443。
+{$WEWALLET_SITE_DOMAIN} {
+	# 上传材料较大，放宽请求体上限（与 nginx client_max_body_size 25m 对齐）。
+	request_body {
+		max_size 25MB
+	}
+
+	# 实时通话代理：/rtc/* 去掉前缀后转给内网 realtime:8870。
+	# handle_path 会剥掉 /rtc，所以 /rtc/v1/realtime-voice/stream → /v1/realtime-voice/stream，
+	# /rtc/api/contradiction-check → /api/contradiction-check。WebSocket 升级 Caddy 自动处理。
+	handle_path /rtc/* {
+		reverse_proxy realtime:8870
+	}
+
+	# 其余全部转给 Python app。
+	handle {
+		reverse_proxy app:8787
+	}
+}

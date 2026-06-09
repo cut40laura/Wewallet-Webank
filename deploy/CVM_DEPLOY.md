@@ -61,6 +61,47 @@ runtime/hermes-agent
 - `HERMES_HOME=/opt/wewallet/hermes-home`
 - `HERMES_AGENT_DIR=/opt/hermes-agent`
 
+## 4.5 语音/视频通话（Caddy 自动 HTTPS，无需自签证书）
+
+通话能在本地用、在服务器用不了，是两个硬限制造成的，已用 Caddy 一并解决：
+
+1. **页面必须 HTTPS**：浏览器只在安全上下文（HTTPS 或 localhost）允许 `getUserMedia` 取摄像头/麦克风。纯 IP 的 HTTP 页面一开通话就报"无法获取麦克风/摄像头"。
+2. **实时代理必须可达且是 wss**：HTTPS 页面不能连 `ws://`（mixed-content）。
+
+方案：Caddy 在边缘自动申请 **Let's Encrypt 受信任证书**（绿锁、无警告、自动续期），并把 `/` 反代到 app、`/rtc` 反代到内网实时代理。**不用自签证书、不用单独开 8870 端口、不用手动信任。**
+
+### (1) 确认域名解析到本机 IP
+
+默认用免费泛解析域名 `115-159-127-218.sslip.io`（自动指向 `115.159.127.218`，无需购买/配置）。
+若用自己的域名，在 `.env` 设 `WEWALLET_SITE_DOMAIN=你的域名`，并把该域名 A 记录解析到服务器 IP。
+
+> Let's Encrypt 签发需要 **80 端口能从公网访问**（你已开放 80/443，无需再开 8870）。
+
+### (2) 配置 `.env` 里的通话凭证
+
+```bash
+# 豆包实时语音（二选一）
+DOUBAO_REALTIME_APP_ID=...
+DOUBAO_REALTIME_ACCESS_KEY=...
+# 或 DOUBAO_REALTIME_API_KEY=...
+
+# 视觉/风控/矛盾检测（火山方舟）
+ARK_API_KEY=...
+
+# 站点域名（默认 sslip.io，可不改）
+WEWALLET_SITE_DOMAIN=115-159-127-218.sslip.io
+```
+
+不配豆包/ARK 凭证，通话代理只会进 mock，不是真通话。
+
+### (3) 访问
+
+```text
+https://115-159-127-218.sslip.io/chat
+```
+
+首次启动 Caddy 会自动签证书（约几十秒），之后绿锁、无警告，**网址可直接分享给别人，点开即用**。
+
 ## 5. 启动
 
 ```bash
@@ -72,19 +113,17 @@ docker compose up -d --build
 ```bash
 docker compose ps
 docker compose logs -f app
+docker compose logs -f caddy      # 看证书签发是否成功
+docker compose logs -f realtime   # 看通话代理是否就绪
 ```
 
-访问：
+访问（Caddy 自动 HTTPS，绿锁无警告，可直接分享）：
 
 ```text
-http://服务器公网 IP/chat
+https://115-159-127-218.sslip.io/chat
 ```
 
-绑定域名和 HTTPS 后访问：
-
-```text
-https://你的域名/chat
-```
+> 80 端口会自动跳转到 443。首次启动需等 Caddy 签发证书（几十秒）。
 
 ## 6. 备份
 

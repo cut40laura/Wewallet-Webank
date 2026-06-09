@@ -526,11 +526,23 @@
   </template>
 
   <script>
-    // 实时通话代理（Node sidecar）地址：默认与页面同主机的 8788 端口，可按需覆盖。
-    window.RTC_PROXY = {
-      wsUrl: `ws://${location.hostname || "localhost"}:8870/v1/realtime-voice/stream`,
-      apiBase: `http://${location.hostname || "localhost"}:8870`
-    };
+    // 实时通话代理地址。
+    // 生产（HTTPS）：经 Caddy 反代到同源 /rtc，用 wss + https，无需开 8870、无 mixed-content。
+    // 本地开发（HTTP）：直连本机 sidecar :8870，走 ws + http。
+    (function () {
+      if (location.protocol === "https:") {
+        window.RTC_PROXY = {
+          wsUrl: `wss://${location.host}/rtc/v1/realtime-voice/stream`,
+          apiBase: `https://${location.host}/rtc`
+        };
+      } else {
+        const host = location.hostname || "localhost";
+        window.RTC_PROXY = {
+          wsUrl: `ws://${host}:8870/v1/realtime-voice/stream`,
+          apiBase: `http://${host}:8870`
+        };
+      }
+    })();
   </script>
   <script src="/static/realtime-voice.js"></script>
   <script src="/static/chat.js"></script>
