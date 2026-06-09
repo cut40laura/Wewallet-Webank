@@ -1695,6 +1695,15 @@ function rtcRestoreLeadingPolarity(original, cleaned) {
   return cleaned;
 }
 
+function rtcRestoreLeadingPause(text) {
+  for (const prefix of ["不是", "没有", "对呀", "对啊", "是的"]) {
+    if (text.startsWith(prefix) && text.length > prefix.length && text[prefix.length] !== "，") {
+      return `${prefix}，${text.slice(prefix.length)}`;
+    }
+  }
+  return text;
+}
+
 function rtcNormalizeAsrText(text) {
   const raw = String(text || "").trim();
   if (!raw) return "";
@@ -1710,7 +1719,7 @@ function rtcNormalizeAsrText(text) {
     const body = String(match[1] || "").replace(/^[\s，,]+|[\s，,]+$/g, "");
     const punct = match[2] || "";
     if (!body) continue;
-    let cleaned = body.replace(/\s+/g, "");
+    let cleaned = body.replace(/[，,]/g, "").replace(/\s+/g, "");
     for (let i = 0; i < 4; i += 1) {
       const prev = cleaned;
       cleaned = rtcCollapseCharRuns(cleaned);
@@ -1719,13 +1728,23 @@ function rtcNormalizeAsrText(text) {
       cleaned = rtcCollapseAdjacentRepeats(cleaned);
       if (cleaned === prev) break;
     }
-    cleaned = rtcRestoreLeadingPolarity(body, cleaned).replace(/^[\s，,]+|[\s，,]+$/g, "");
+    cleaned = rtcRestoreLeadingPause(rtcRestoreLeadingPolarity(body, cleaned)).replace(/^[\s，,]+|[\s，,]+$/g, "");
     if (cleaned) parts.push(`${cleaned}${punct}`);
   }
   const out = [];
   const keys = [];
   for (const part of parts) {
-    const key = part.replace(/[。！？]$/, "");
+    const key = part.replace(/[。！？]$/, "").replace(/，/g, "");
+    while (keys.length && key && keys[keys.length - 1] && key !== keys[keys.length - 1] && key.includes(keys[keys.length - 1])) {
+      keys.pop();
+      out.pop();
+    }
+    if (keys.length >= 2 && key.includes(`${keys[keys.length - 2]}${keys[keys.length - 1]}`)) {
+      keys.pop();
+      out.pop();
+      keys.pop();
+      out.pop();
+    }
     if (keys.length && keys[keys.length - 1] === key) continue;
     out.push(part);
     keys.push(key);
@@ -2034,6 +2053,7 @@ const videoCallSelf = document.getElementById("videoCallSelf");
 function describeObservation(o) {
   const parts = [];
   if (o.caption) parts.push(o.caption);
+  if (o.person_description) parts.push(`人物：${o.person_description}`);
   if (o.notable_objects && o.notable_objects.length) parts.push(`可见：${o.notable_objects.join("、")}`);
   if (o.document_text) parts.push(`证件文字：${o.document_text}`);
   return parts.join("；") || "画面看不太清";
@@ -2507,6 +2527,9 @@ async function videoFinalizeCall(callId, transcript, observations, startedAtMs, 
     const { image, ...rest } = o || {};
     return rest;
   });
+  const frames = (observations || [])
+    .map((o) => ({ ts: o && o.ts, image: o && o.image }))
+    .filter((frame) => typeof frame.image === "string" && frame.image);
   let risk = null;
   try {
     const r = await fetch(`${RTC_CFG.apiBase}/api/risk-summary`, {
@@ -2521,7 +2544,7 @@ async function videoFinalizeCall(callId, transcript, observations, startedAtMs, 
   risk = videoMergeContradictions(risk, flagged);
   const metadata = videoBuildMetadata(observations, startedAtMs, channel);
   try {
-    await postJson(`/api/video-call/${callId}/complete`, { transcript, observations, risk, metadata });
+    await postJson(`/api/video-call/${callId}/complete`, { transcript, observations: leanObservations, frames, risk, metadata });
   } catch (e) {
     // 落库失败仅记录，不影响已结束的通话
     console.warn("视频通话记录保存失败", e);
@@ -2617,9 +2640,17 @@ function closeVideoCall() {
 // 页面被直接关闭/刷新时的兜底：用 sendBeacon 把已有内容尽力补到 complete（跳过风控总结）。
 window.addEventListener("beforeunload", () => {
   if (!videoCall.callId) return;
+  const leanObservations = (videoCall.observationsLog || []).map((o) => {
+    const { image, ...rest } = o || {};
+    return rest;
+  });
+  const frames = (videoCall.observationsLog || [])
+    .map((o) => ({ ts: o && o.ts, image: o && o.image }))
+    .filter((frame) => typeof frame.image === "string" && frame.image);
   const body = JSON.stringify({
     transcript: videoCall.transcriptLog,
-    observations: videoCall.observationsLog,
+    observations: leanObservations,
+    frames,
     risk: videoMergeContradictions(null, videoCall.contradictionsLog),
     metadata: videoBuildMetadata(videoCall.observationsLog, videoCall.startedAtMs, videoCallChannel())
   });

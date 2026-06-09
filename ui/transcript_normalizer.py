@@ -89,6 +89,13 @@ def _restore_leading_polarity(original: str, cleaned: str) -> str:
     return cleaned
 
 
+def _restore_leading_pause(text: str) -> str:
+    for prefix in ("不是", "没有", "对呀", "对啊", "是的"):
+        if text.startswith(prefix) and len(text) > len(prefix) and text[len(prefix)] != "，":
+            return f"{prefix}，{text[len(prefix):]}"
+    return text
+
+
 def normalize_call_text(text: Any) -> str:
     """Normalize one transcript string while preserving the intended meaning."""
     raw = str(text or "").strip()
@@ -105,7 +112,7 @@ def normalize_call_text(text: Any) -> str:
         punct = match.group(2)
         if not body:
             continue
-        cleaned = _SPACE_RE.sub("", body)
+        cleaned = _SPACE_RE.sub("", body.replace("，", "").replace(",", ""))
         for _ in range(4):
             prev = cleaned
             cleaned = _collapse_char_runs(cleaned)
@@ -114,14 +121,22 @@ def normalize_call_text(text: Any) -> str:
             cleaned = _collapse_adjacent_repeats(cleaned)
             if cleaned == prev:
                 break
-        cleaned = _restore_leading_polarity(body, cleaned).strip(" ，,")
+        cleaned = _restore_leading_pause(_restore_leading_polarity(body, cleaned)).strip(" ，,")
         if cleaned:
             parts.append(f"{cleaned}{punct}")
 
     out: list[str] = []
     keys: list[str] = []
     for part in parts:
-        key = re.sub(r"[。！？]$", "", part)
+        key = re.sub(r"[。！？]$", "", part).replace("，", "")
+        while keys and key and keys[-1] and keys[-1] in key and keys[-1] != key:
+            keys.pop()
+            out.pop()
+        if len(keys) >= 2 and f"{keys[-2]}{keys[-1]}" in key:
+            keys.pop()
+            out.pop()
+            keys.pop()
+            out.pop()
         if keys and keys[-1] == key:
             continue
         out.append(part)
@@ -143,6 +158,8 @@ def normalize_transcript(transcript: Any) -> tuple[Any, dict[str, Any]]:
         if role not in {"user", "ai"}:
             role = "user" if role == "客户" else "ai" if role in {"assistant", "bot"} else role
         text = normalize_call_text(item.get("text"))
+        if role == "ai":
+            text = str(item.get("text") or "").strip()
         if not role or not text:
             continue
         raw_text = str(item.get("text") or "")
@@ -188,6 +205,7 @@ def normalize_observations(observations: Any) -> tuple[Any, dict[str, Any]]:
         "place_type",
         "person_present",
         "person_count",
+        "person_description",
         "looking_off_screen",
         "visible_documents",
         "document_text",

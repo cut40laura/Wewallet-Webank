@@ -117,6 +117,7 @@ class VideoCallPersistenceTest(unittest.TestCase):
             {
                 "place_type": "居住/宿舍",
                 "person_present": True,
+                "person_description": "戴眼镜，穿深色上衣，手托脸看向镜头",
                 "notable_objects": ["上下铺床", "上下铺床", ""],
                 "visible_documents": [],
                 "caption": " 一名男子处于宿舍内 ",
@@ -146,6 +147,7 @@ class VideoCallPersistenceTest(unittest.TestCase):
                 {
                     "place_type": "居住/宿舍",
                     "person_present": True,
+                    "person_description": "戴眼镜，穿深色上衣，手托脸看向镜头",
                     "notable_objects": ["上下铺床"],
                     "caption": "一名男子处于宿舍内",
                     "ts": 1780989380.928,
@@ -154,6 +156,59 @@ class VideoCallPersistenceTest(unittest.TestCase):
         )
         self.assertTrue(done["metadata"]["normalization"]["transcript"]["changed"])
         self.assertGreater(done["metadata"]["normalization"]["transcript"]["chars_removed"], 0)
+
+    def test_complete_normalizes_latest_video_call_samples(self) -> None:
+        call_id = video_calls.start_call(ENT_A, "user-1")
+        transcript = [
+            {
+                "role": "user",
+                "text": (
+                    "我我我我现在我现在我现在我现在在我现在在我现在在飞机"
+                    "我现在在飞机上我现在在飞机上呢我现在在飞机上呢。我现在在飞机上呢"
+                    "有点我现在在飞机上呢有点听不到我现在在飞机上呢，有点听不到。"
+                    "我现在在飞机上呢有点听不到我现在在飞机上呢，有点听不到。"
+                    "我现在在飞机上呢，有点听不到。"
+                ),
+                "ts": 1,
+            },
+            {
+                "role": "user",
+                "text": (
+                    "嗯嗯嗯嗯对嗯对嗯对口嗯对口误嗯对口误了对，口误了。"
+                    "嗯对口误了嗯对口误了嗯，对口误了。嗯，对口误了。"
+                ),
+                "ts": 2,
+            },
+            {
+                "role": "user",
+                "text": (
+                    "你你你为什么你为什么觉得你为什么觉得我在宿舍"
+                    "你为什么觉得我在宿舍不觉得我在公务舱呢"
+                    "你为什么觉得我在宿舍，不觉得我在公务舱呢？"
+                    "你为什么觉得我在宿舍，不觉得我在公务舱呢？"
+                ),
+                "ts": 3,
+            },
+        ]
+
+        video_calls.complete_call(
+            call_id,
+            ENT_A,
+            transcript=transcript,
+            observations=[],
+            risk=None,
+            metadata={"duration_sec": 12},
+        )
+
+        done = video_calls.load_call(call_id, ENT_A)
+        self.assertEqual(
+            [item["text"] for item in done["transcript"]],
+            [
+                "我现在在飞机上呢有点听不到。",
+                "嗯对口误了。",
+                "你为什么觉得我在宿舍不觉得我在公务舱呢？",
+            ],
+        )
 
 
 if __name__ == "__main__":

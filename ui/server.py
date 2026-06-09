@@ -223,7 +223,11 @@ def _video_image_history_hits(enterprise_id: str, image_data_url: str) -> list[d
 
 
 def _persist_observation_frames(
-    enterprise_id: str, call_id: str, observations: Any
+    enterprise_id: str,
+    call_id: str,
+    observations: Any,
+    frames: Any = None,
+    started_at: str | None = None,
 ) -> Any:
     """Persist the actual camera frame attached to each observation as a file
     and replace the inline base64 ``image`` with a served ``image_url``.
@@ -234,13 +238,16 @@ def _persist_observation_frames(
     """
     if not isinstance(observations, list):
         return observations
-    safe_call = re.sub(r"[^A-Za-z0-9_-]", "", str(call_id or ""))[:64] or "call"
+    frame_items = frames if isinstance(frames, list) else []
+    safe_call = _video_call_upload_slug(call_id, started_at)
     frame_dir = enterprise_uploads_dir(enterprise_id) / "video-calls" / safe_call
     made_dir = False
     for idx, obs in enumerate(observations):
         if not isinstance(obs, dict):
             continue
         image = obs.pop("image", None)  # 不把 base64 大字段写进 DB，只留 image_url
+        if not image and idx < len(frame_items) and isinstance(frame_items[idx], dict):
+            image = frame_items[idx].get("image")
         if not isinstance(image, str) or not image:
             continue
         try:
@@ -253,17 +260,33 @@ def _persist_observation_frames(
         if not made_dir:
             frame_dir.mkdir(parents=True, exist_ok=True)
             made_dir = True
-        try:
-            ts = int(float(obs.get("ts") or time.time()))
-        except (TypeError, ValueError):
-            ts = int(time.time())
-        name = f"frame-{idx:03d}-{ts}.jpg"
+        frame_stamp = _frame_upload_stamp(obs.get("ts") or time.time())
+        name = f"frame-{idx:03d}-{frame_stamp}.jpg"
         try:
             (frame_dir / name).write_bytes(raw)
         except OSError:
             continue
         obs["image_url"] = f"/uploads/{enterprise_id}/video-calls/{safe_call}/{name}"
     return observations
+
+
+def _video_call_upload_slug(call_id: str, started_at: str | None = None) -> str:
+    safe_id = re.sub(r"[^A-Za-z0-9]", "", str(call_id or ""))[:8] or "unknown"
+    stamp = "unknown-time"
+    match = re.search(
+        r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})",
+        str(started_at or ""),
+    )
+    if match:
+        stamp = f"{match.group(1)}{match.group(2)}{match.group(3)}-{match.group(4)}{match.group(5)}{match.group(6)}"
+    return f"video-call-{stamp}-{safe_id}"
+
+
+def _frame_upload_stamp(value: Any) -> str:
+    try:
+        return time.strftime("%Y%m%d-%H%M%S", time.localtime(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return time.strftime("%Y%m%d-%H%M%S")
 
 
 def _stream_text_chunks(text: str, emit: Any, *, delay_s: float = 0.012) -> None:
@@ -738,20 +761,33 @@ class Handler(BaseHTTPRequestHandler):
                 _user, enterprise = self.current_context()
                 call_id = self.path[len("/api/video-call/"):-len("/complete")]
                 payload = self.read_json()
+                existing_call = video_calls.load_call(call_id, str(enterprise["id"]))
+                if not existing_call:
+                    self.send_json({"error": "通话记录不存在"}, status=404)
+                    return
                 observations = _persist_observation_frames(
-                    str(enterprise["id"]), call_id, payload.get("observations")
+                    str(enterprise["id"]),
+                    call_id,
+                    payload.get("observations"),
+                    payload.get("frames"),
+                    existing_call.get("started_at"),
                 )
+                metadata = payload.get("metadata")
+                if isinstance(metadata, dict) and isinstance(observations, list):
+                    saved_frames = sum(
+                        1 for obs in observations if isinstance(obs, dict) and obs.get("image_url")
+                    )
+                    metadata = {**metadata, "saved_frame_count": saved_frames}
+                    if metadata.get("frame_count") and not saved_frames:
+                        metadata["missing_frame_images"] = True
                 updated = video_calls.complete_call(
                     call_id,
                     str(enterprise["id"]),
                     transcript=payload.get("transcript"),
                     observations=observations,
                     risk=payload.get("risk"),
-                    metadata=payload.get("metadata"),
+                    metadata=metadata,
                 )
-                if not updated:
-                    self.send_json({"error": "通话记录不存在"}, status=404)
-                    return
                 # 回写来源：视频/语音通话共用此端点，由前端声明来源（默认视频，保持后向兼容）。
                 source = str(payload.get("source") or "视频通话").strip() or "视频通话"
                 # 把通话中发现的矛盾/疑点回写为跨渠道"待核验点"，让文字与视频/语音各端继续咬住。

@@ -5,7 +5,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export HERMES_HOME="$ROOT/.hermes-customer-manager"
 cd "$ROOT"
 
-if command -v python3.13 >/dev/null 2>&1; then
+if [ -x "$ROOT/.venv/bin/python" ]; then
+  PYTHON_BIN="$ROOT/.venv/bin/python"
+elif command -v python3.13 >/dev/null 2>&1; then
   PYTHON_BIN="python3.13"
 elif command -v python3.11 >/dev/null 2>&1; then
   PYTHON_BIN="python3.11"
