@@ -1,5 +1,26 @@
-# 站点域名来自环境变量 WEWALLET_SITE_DOMAIN（默认 sslip.io 免费域名）。
-# Caddy 会自动为该域名申请并续期 Let's Encrypt 证书，自动把 80 跳转到 443。
+{
+	# 这台腾讯云大陆服务器在未绑定/备案自有域名前，免费 IP 泛域名可能被拦截，
+	# 因此保留公网 IP 的 HTTP 访问，不做自动跳 HTTPS，避免把文字功能也带坏。
+	auto_https disable_redirects
+}
+
+# 公网 IP：保留 HTTP 访问，给文字聊天、钱包、画像等非媒体功能兜底。
+http://115.159.127.218 {
+	request_body {
+		max_size 25MB
+	}
+
+	handle_path /rtc/* {
+		reverse_proxy realtime:8870
+	}
+
+	handle {
+		reverse_proxy app:8787
+	}
+}
+
+# 站点域名来自环境变量 WEWALLET_SITE_DOMAIN。
+# 域名解析/备案可用后，Caddy 会自动为该域名申请并续期 Let's Encrypt 证书。
 {$WEWALLET_SITE_DOMAIN} {
 	# 上传材料较大，放宽请求体上限（与 nginx client_max_body_size 25m 对齐）。
 	request_body {
