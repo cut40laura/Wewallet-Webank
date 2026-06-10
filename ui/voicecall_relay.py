@@ -203,6 +203,15 @@ class _DoubaoBridge:
         # 用户当前是否在"一段语音"中：一句话有几十个 interim ASR 帧，只在起点动作一次
         # （发 speech_started + 打断），整段不重复，避免把小微切碎。ASR_ENDED 时复位。
         self.user_turn_active = False
+        # 用户刚说完、小微的回复还没播完（ASR_ENDED → TTS_ENDED 之间）。这段"等回复"间隙
+        # ai_speaking/user_turn_active 都是 False、看似空闲，实则真实回复 ~1s 后就到——此时
+        # flush 画面注入设的 suppress 窗会把真实回复整条吞掉（"突然不回复，再说一句才好"的根因）。
+        # 故 flush 的空闲判定必须把它也算上。下次用户开口（ASR 起点）自然复位，不会卡死。
+        self.awaiting_reply = False
+        # 打断后丢弃被打断旧轮的残留帧：发 CLIENT_INTERRUPT 到豆包真停下来之间，旧轮的
+        # 文本/字幕/音频帧还会陆续到达，不丢会和用户的话、和新回复交替播出（断断续续+冲突）。
+        # 从发出打断起置位，ASR_ENDED（用户说完，新回复在它之后才来）清除。
+        self.discard_old_turn = False
 
 
 _SUPPRESS_SECONDS = 3.0  # 吞画面播报的安全上限：够吞掉那条即时的画面复述即可。
@@ -226,8 +235,8 @@ async def _flush_pending_vision(bridge: _DoubaoBridge) -> None:
     """
     if not bridge.pending_vision:
         return
-    if bridge.ai_speaking or bridge.user_turn_active:
-        return  # 不空闲，先攒着
+    if bridge.ai_speaking or bridge.user_turn_active or bridge.awaiting_reply:
+        return  # 不空闲（在播 / 用户在说 / 等回复间隙），先攒着
     content = bridge.pending_vision
     bridge.pending_vision = None
     bridge.suppress_until = time.monotonic() + _SUPPRESS_SECONDS  # 吞掉这条触发的复述
@@ -307,8 +316,12 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
         suppressing = bridge.suppress_until > time.monotonic()
         if suppressing and frame.event in (dbq.EVENT_CHAT_RESPONSE, dbq.EVENT_TTS_SUBTITLE):
             _dbg(f"  -> 吞掉播报 ev={_DBG_EVENT_NAMES.get(frame.event)} json={(frame.json or {})}")
+        if bridge.discard_old_turn and frame.event in (
+            dbq.EVENT_CHAT_RESPONSE, dbq.EVENT_TTS_SUBTITLE, dbq.EVENT_TTS_RESPONSE,
+        ):
+            _dbg(f"  -> 丢弃被打断旧轮残留 ev={_DBG_EVENT_NAMES.get(frame.event)}")
         for payload in dbq.translate_frame(frame):
-            if suppressing and payload.get("type") in (
+            if (suppressing or bridge.discard_old_turn) and payload.get("type") in (
                 "response.text.delta", "response.audio.delta", "response.audio_transcript.delta",
             ):
                 continue
@@ -322,27 +335,34 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
         # suppress、把这条回复剩下的语音吞掉（"没说完就被吞"的根因）。故只在 TTS_ENDED 清。
         # 兜底：若某条回复无 TTS/丢了 TTS_ENDED 导致卡 True，下次用户开口会复位（见打断逻辑）。
         if frame.event in (dbq.EVENT_TTS_SENTENCE_START, dbq.EVENT_TTS_RESPONSE):
-            bridge.ai_speaking = True
+            if not bridge.discard_old_turn:  # 被打断旧轮的残留帧不算"在播报"
+                bridge.ai_speaking = True
         elif frame.event == dbq.EVENT_TTS_ENDED:
             bridge.ai_speaking = False
+            bridge.awaiting_reply = False  # 这轮回复播完，"等回复"间隙结束，可以安全 flush 画面了
 
         # 用户语音"起点"才动作一次：通知前端停播+截帧（speech_started），并在 AI 正说时打断她。
         # 整段语音的后续 interim 帧都跳过——否则几十个 interim 会把小微反复掐断。
         if frame.event == dbq.EVENT_ASR_RESPONSE:
             if not bridge.user_turn_active:
                 bridge.user_turn_active = True
+                bridge.awaiting_reply = False  # 兜底：上轮若无 TTS/丢了 TTS_ENDED，别让它卡死 flush
                 await bridge.browser.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
                 if bridge.ai_speaking and bridge.session_started:
                     await bridge.upstream.send(
                         dbq.make_full_client_frame(dbq.EVENT_CLIENT_INTERRUPT, {}, bridge.session_id))
                     bridge.ai_speaking = False
+                    bridge.discard_old_turn = True  # 打断生效前旧轮还会漏几帧，全部丢弃
         elif frame.event == dbq.EVENT_ASR_ENDED:
             bridge.user_turn_active = False  # 本段用户语音结束，下段重新允许起点动作
+            bridge.awaiting_reply = True  # 真实回复马上要来，进入"等回复"间隙，禁 flush
+            bridge.discard_old_turn = False  # 旧轮残留早已排干（打断在这句话开头），恢复转发新回复
 
-        # 一旦回到空闲（她说完/用户说完），把攒着的画面文字补发出去。【不在 CHAT_ENDED flush】：
-        # 那时 TTS 还在播，flush 设 suppress 会切掉她正在说的尾音。改在 TTS_ENDED（音频真播完）
-        # 和 ASR_ENDED（用户说完）才 flush。vision 完成时自身也会 flush，不漏。
-        if frame.event in (dbq.EVENT_TTS_ENDED, dbq.EVENT_ASR_ENDED):
+        # 只在 TTS_ENDED（她真说完、用户也没在说）flush 画面。【不在 CHAT_ENDED】：那时 TTS
+        # 还在播，suppress 会切掉尾音。【也不在 ASR_ENDED】：用户刚说完、真实回复 ~1s 后就到，
+        # 此时 flush 设的 suppress 窗会把整条真实回复吞掉（"突然不回复"的根因）。
+        # vision 完成时自身也会 flush（同受 awaiting_reply 闸门约束），不漏。
+        if frame.event == dbq.EVENT_TTS_ENDED:
             await _flush_pending_vision(bridge)
 
         if frame.event == dbq.EVENT_CONNECTION_STARTED:

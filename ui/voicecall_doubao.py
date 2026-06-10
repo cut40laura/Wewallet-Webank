@@ -218,7 +218,11 @@ def translate_frame(frame: DoubaoFrame) -> list[dict[str, Any]]:
         })
     elif ev == EVENT_ASR_ENDED:
         out.append({"type": "input_audio_transcription.done"})
-    elif ev in (EVENT_CHAT_ENDED, EVENT_TTS_ENDED):
+    elif ev == EVENT_TTS_ENDED:
+        # 只在音频真正播完时发 response.done。CHAT_ENDED（文字生成完）比 TTS_ENDED 早 ~1.5s，
+        # 若也翻成 response.done，前端会在 TTS 字幕还在流时清字幕状态 + 记录一次回复，
+        # 导致字幕从半句中间断头重来、同一句话双份进通话记录。CHAT_ENDED 走下面的
+        # proxy.event 透传，前端不动作。
         out.append({"type": "response.done", "event": ev})
     elif ev in (EVENT_SESSION_FAILED, EVENT_CONNECTION_FAILED):
         out.append({"type": "error", "event": ev,

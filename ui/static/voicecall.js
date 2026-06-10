@@ -225,6 +225,10 @@
     let selfCaption = ""; // 小微当前回复字幕累积（一段一段显示，整轮累积到一起）
     let gotSubtitle = false; // 本轮是否收到过 TTS 字幕事件（有就不用文本兜底，避免字幕翻倍）
     let aiTurn = ""; // 小微本轮完整回复文本累积（用于挂断回流，独立于字幕显示）
+    // 打断后丢弃被打断旧轮的残留帧：stopPlayback 只停得了本地已排期的播放，浏览器 ws 缓冲里
+    // 还在路上的旧轮音频/字幕会陆续到达——不丢的话会和你的话、和新回复交替播出（断断续续+冲突）。
+    // 从 speech_started 起置位，到本段用户语音结束（ASR done）清除；response.done 兜底清除。
+    let discardOldTurn = false;
     let lastAutoVision = 0; // 上次自动看画面的时间戳（节流）
     let visionBusy = false; // 一次看画面在途，避免叠发
     const AUTO_VISION_MIN_GAP_MS = 3000; // 每轮看一眼，但最快 3 秒一次
@@ -235,8 +239,9 @@
     // 用户**持续够响**（真想插话）才放行，并本地立即停播实现打断。
     let aiSpeakingUntil = 0; // 预计小微播放到的时间戳（>now 表示她正在说）
     let bargeFrames = 0; // 用户连续够响的帧数
-    const BARGE_LEVEL = 0.14; // 判为"用户在说话"的能量阈值
-    const BARGE_MIN_FRAMES = 2; // 需连续这么多帧（帧≈43ms，约 86ms）才放行打断，滤掉瞬态噪声
+    const BARGE_LEVEL = 0.18; // 判为"用户在说话"的能量阈值（0.14 时外放回声易误触发，掐碎她的回复）
+    const BARGE_MIN_FRAMES = 6; // 需连续这么多帧（帧≈43ms，约 260ms）才放行打断：真插话轻松超过，
+    // 回声/瞬态噪声很难连续这么久。代价是打断响应慢 ~170ms，听感上可忽略。
 
     // 每轮自动看一眼：你一开口就截一帧静默发给中继，等你说完小微回应时已看到当前画面。
     function autoVision() {
@@ -287,26 +292,57 @@
       aiSpeakingUntil = Date.now() + Math.max(0, nextPlayTime - now) * 1000 + 400;
     }
 
+    // 收轮收尾（切聆听态 + 字幕淡出）等到本地播放排完再做：aiSpeakingUntil 是
+    // playDelta 维护的"预计播到何时"，比 response.done（服务端发完）晚好几秒。
+    let turnEndTimer = 0;
+    function scheduleTurnEnd() {
+      if (turnEndTimer) clearTimeout(turnEndTimer);
+      turnEndTimer = setTimeout(() => {
+        turnEndTimer = 0;
+        if (Date.now() < aiSpeakingUntil) { scheduleTurnEnd(); return; } // 又排上新音频，再等
+        setCallState("listening");
+        setOrbLevel(0);
+        fadeCaptionSoon();
+      }, Math.max(0, aiSpeakingUntil - Date.now()));
+    }
+
     function handleEvent(ev) {
       switch (ev.type) {
         case "input_audio_buffer.speech_started":
           // 客户开口 → 打断小微正在播的话（barge-in）+ 顺手截一帧让她"看到"当前画面。
           stopPlayback();
+          discardOldTurn = true; // 旧轮残留的音频/字幕帧后面还会到，统统丢掉
+          // 被打断的半句也记进通话记录（她确实说出口了一半），随后复位累积，
+          // 免得新回复的字幕/记录接在旧轮后面拼成一条。
+          recordTurn("ai", aiTurn);
+          aiTurn = "";
+          selfCaption = "";
+          gotSubtitle = false;
+          fadeCaptionSoon();
           setCallState("listening");
           setOrbLevel(0);
           setStatus("在听您说...");
           autoVision();
           break;
         case "response.audio.delta":
+          if (discardOldTurn) break; // 被打断旧轮的残留音频，丢弃
           if (ev.delta) { setCallState("speaking"); playDelta(base64ToFloat32(ev.delta)); }
           break;
         case "response.audio_transcript.delta":
-          gotSubtitle = true;
+          if (discardOldTurn) break; // 旧轮残留字幕，丢弃
+          // 首条 TTS 字幕到达：丢掉文本兜底已累积的内容（LLM 文本先到、TTS 字幕后到，
+          // 不清会"文本版 + 字幕版"拼在一起，同一句翻倍）。之后整轮只认字幕这一路。
+          if (!gotSubtitle) {
+            gotSubtitle = true;
+            selfCaption = "";
+            aiTurn = "";
+          }
           selfCaption += ev.delta || "";
           aiTurn += ev.delta || "";
           showCaption("小微：" + selfCaption);
           break;
         case "response.text.delta":
+          if (discardOldTurn) break; // 旧轮残留文本，丢弃
           // 字幕兜底：豆包实时对话发的是文本(ChatResponse)而非 TTS 字幕事件，没有
           // audio_transcript.delta；本轮若没收到字幕事件，就用文本当字幕显示。
           if (!gotSubtitle) {
@@ -326,9 +362,14 @@
           aiTurn = "";
           selfCaption = "";
           gotSubtitle = false;
-          setCallState("listening");
-          setOrbLevel(0);
-          fadeCaptionSoon();
+          discardOldTurn = false; // 兜底：万一 ASR done 丢了，别把下一轮也丢掉
+          // TTS_ENDED 只代表服务端音频**发完**，浏览器本地还排着几秒缓冲没播完。
+          // 等本地播放真正排完再切聆听态、让字幕淡出，否则话音未落字幕就先消失。
+          scheduleTurnEnd();
+          break;
+        case "input_audio_transcription.done":
+          // 本段用户语音结束：旧轮残留早已排干（打断发生在你这句话开头），新回复马上来，恢复播放。
+          discardOldTurn = false;
           break;
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript) { setStatus("我：" + ev.transcript); recordTurn("user", ev.transcript); }
@@ -408,6 +449,7 @@
 
     function stop() {
       stopPlayback();
+      if (turnEndTimer) { clearTimeout(turnEndTimer); turnEndTimer = 0; }
       if (levelRAF) { cancelAnimationFrame(levelRAF); levelRAF = 0; }
       analyser = null;
       try { workletNode && workletNode.disconnect(); } catch (e) {}
