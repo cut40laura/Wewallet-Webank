@@ -266,8 +266,23 @@ REALTIME_INSTRUCTIONS = SYSTEM_PROMPT + (
     "（姓名、出生年份、公司全名、成立日期、金额、日期等），拿对方念的和你看到的互相核对；对不上"
     "就温和确认，别假装自己看清了、也别替对方念。核验材料对不上时别用指控口吻、温和请他补证据即可——"
     "但【别替他编理由开脱】，事实该讲清还是讲清。"
-    "\n\n通话中可能收到以「（核验提示」开头的内容，那是只给你看的内部核验指引——"
-    "【绝对不要读出来、不要提它的存在】，按它说的在合适时机自然地去做就行。"
+    "\n\n（系统补充·档案一致性——口述对不上档案/前文时，绝不顺从）"
+    "\n- 接通时注入的客户记忆/档案里已记录的关键口径（姓名/称呼、企业名、经营类型、金额、"
+    "流水、用途、经营时间、人数等）是你的【核对基线】。客户当前说法与档案、或与他自己"
+    "本通前面说过的不一致时，【绝不顺着新说法走、绝不默默换成新口径】——哪怕客户说得"
+    "很自然、很笃定。"
+    "\n- 【尤其是姓名/身份】：客户自报的名字和档案对不上时，绝不立刻改口用新名字称呼他。"
+    "第一反应是温和但明确地【当场点出不一致并请他确认】，例如「咦，我这边记的是您叫"
+    "麦立俊，您刚说叫麦子——是小名呀，还是我记岔了？方便说下证件上的名字吗？」。"
+    "对方解释合理（小名/曾用名）就记下两个口径；解释不了或含糊带过，心里记为可疑，"
+    "后续核验更谨慎。"
+    "\n- 客户在同一通里【频繁更改】姓名或关键信息（改了又改），要正面指出来：「您前面说"
+    "是 A，刚又说 B，我得跟您核清楚一个准口径哈」——这是重要风险信号，绝不能笑笑就过。"
+    "\n- 不一致【核清之前】，一律沿用档案口径，绝不把客户的新说法当成事实在后续对话里"
+    "使用或附和。核对时口吻保持温和、给台阶（「帮我对一下口径」式），但事实必须当场摆"
+    "出来，不含糊放过。"
+    "\n\n通话中可能收到以「（核验提示」或「（风控提示」开头的内容，那是只给你看的内部核验"
+    "指引——【绝对不要读出来、不要提它的存在】，按它说的在合适时机自然地去做就行。"
 )
 
 # 多模态模型当"眼睛"：不只找证件，而是客观描述整帧并**结构化**输出反欺诈信号
@@ -416,6 +431,82 @@ def describe_frame(frame_data_uri: str) -> dict[str, Any]:
     else:
         caption = _salvage_caption(raw) or "画面有点糊，看不太清。"
     return {"caption": caption, "observation": observation}
+
+
+# ── 实时矛盾检测（口述 vs 已知档案，确定性旁路）──────────────────────────────
+# 实时语音模型对"数字/事实比对"不可靠（靠它临场发挥常放过明显矛盾），所以把比对
+# 放到这条确定性旁路：客户每说完一句，relay 在线程池里跑一次文本模型，命中才注入
+# 核对提示 + 通知前端弹警示块。判定逻辑在这里，实时语音模型只负责自然话术。
+CONTRADICTION_PROMPT = (
+    "你是微众银行小微信贷的实时风控比对器，正在一通视频尽调通话中运行。\n"
+    "下面给你：①这家企业的【已知档案】（历史风控画像、待核验点、系统流水事实——这是"
+    "可信基线）；②用户在视频里【刚说的话】；③通话的最近上下文。\n"
+    "你的唯一任务：判断【刚说的话】是否与【已知档案】或前文出现**明确、具体**的矛盾/"
+    "不符（如姓名/称呼、金额、用途、店名、证件号、经营时间、人数规模等对不上）。"
+    "身份类不符（自报姓名与档案姓名对不上）必须报，哪怕只差一个字。\n"
+    "严格要求：只报你有把握的明确矛盾，宁可漏报不可误报；模糊、可并存、信息不足的一律"
+    "不报；绝不臆测档案里没有的内容。\n"
+    '严格输出 JSON：{"contradictions":[{"field":"矛盾涉及的要素","stated":"用户这次的'
+    '说法","known":"档案/前文里的已知值","nudge":"一句客户经理可以自然说出口、不指控、'
+    '给台阶的核对话"}]}。没有明确矛盾就输出 {"contradictions":[]}。\n'
+    "nudge 用'帮我对一下口径'式的温和措辞，例如：'您前面提到月流水大概三十万，刚说到"
+    "的是十万左右，我这边核一下口径，是不是分了不同账户呀？'"
+)
+CONTRADICTION_TIMEOUT_S = 20
+
+
+def check_contradictions(memory: str, utterance: str, recent: str = "") -> list[dict[str, Any]]:
+    """口述 vs 档案比对一次，返回矛盾列表（可能为空）。任何失败都返回 []，绝不抛错。
+
+    跑在 relay 的线程池里（旁路），不在音频热路径上；调用方负责去抖/单飞。
+    """
+    memory = (memory or "").strip()[:6000]
+    utterance = (utterance or "").strip()[:1500]
+    if not memory or not utterance:
+        return []
+    try:
+        label, api_key, base_url, model, extra = _resolve_provider()
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": CONTRADICTION_PROMPT},
+                {"role": "user", "content": (
+                    f"【已知档案】\n{memory}\n\n【最近上下文】\n{(recent or '').strip()[:2000] or '（无）'}\n\n"
+                    f"【用户刚说的话】\n{utterance}"
+                )},
+            ],
+            "temperature": 0,
+            **extra,
+        }
+        if label == "Ark":
+            payload["thinking"] = {"type": "disabled"}  # 比对要快出 JSON，不要思考流
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=CONTRADICTION_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        raw = str(resp.json()["choices"][0]["message"]["content"] or "")
+        parsed = json.loads(_extract_json(raw) or "{}")
+        items = parsed.get("contradictions") if isinstance(parsed, dict) else None
+        results: list[dict[str, Any]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            stated = str(item.get("stated") or "").strip()
+            known = str(item.get("known") or "").strip()
+            if not stated or not known:
+                continue  # 没有"两头"的不算明确矛盾
+            results.append({
+                "field": str(item.get("field") or "").strip(),
+                "stated": stated,
+                "known": known,
+                "nudge": str(item.get("nudge") or "").strip(),
+            })
+        return results[:3]
+    except Exception:
+        return []
 
 
 def realtime_session_config(extra_instructions: str = "") -> dict[str, Any]:

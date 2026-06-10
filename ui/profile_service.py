@@ -88,6 +88,60 @@ def save_profile_state(enterprise_id: str, state: dict[str, Any]) -> None:
     save_json_file(enterprise_profile_state_file(enterprise_id), state)
 
 
+# ── 跨渠道待核实项（open verifications）────────────────────────────────────
+# 视频通话挂断后的风控总结（video_calls.schedule_risk_review）把疑点回写到这里，
+# 主聊天和下一通电话的小微都会在 prompt 里看到，跨渠道咬住、不让疑点不了了之。
+# 存在 profile_state.json 里（轻量 JSON，画像更新流程已在读写同一文件）。
+OPEN_VERIFICATIONS_MAX = 12
+
+
+def add_open_verifications(enterprise_id: str, items: list[dict[str, Any]]) -> int:
+    """追加待核实项（按文本去重、上限截断），返回实际新增条数。"""
+    if not enterprise_id or not items:
+        return 0
+    state = load_profile_state(enterprise_id)
+    existing = state.get("open_verifications")
+    if not isinstance(existing, list):
+        existing = []
+    known_texts = {str(item.get("text") or "") for item in existing if isinstance(item, dict)}
+    added = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text or text in known_texts:
+            continue
+        known_texts.add(text)
+        existing.append({
+            "text": text,
+            "source": str(item.get("source") or ""),
+            "level": str(item.get("level") or ""),
+            "created_at": iso_now(),
+        })
+        added += 1
+    if added:
+        state["open_verifications"] = existing[-OPEN_VERIFICATIONS_MAX:]
+        save_profile_state(enterprise_id, state)
+    return added
+
+
+def list_open_verifications(enterprise_id: str) -> list[dict[str, Any]]:
+    items = load_profile_state(enterprise_id).get("open_verifications")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def open_verifications_block(enterprise_id: str) -> str:
+    """拼成可注入 prompt 的待核实清单；为空返回空串（调用方据此决定是否注入）。"""
+    items = list_open_verifications(enterprise_id)
+    if not items:
+        return ""
+    lines = []
+    for item in items:
+        source = f"（{item['source']}）" if item.get("source") else ""
+        lines.append(f"- {item.get('text', '')}{source}")
+    return "\n".join(lines)
+
+
 def transcript_for_prompt(messages: list[dict[str, str]]) -> str:
     lines = []
     for message in messages[-24:]:
@@ -412,7 +466,9 @@ def conversation_drift_turns(messages: list[dict[str, Any]]) -> int:
 
 # 注入聊天 prompt 时只保留对"承接对话 + 交叉验算 + 咬住待核验"最有用的章节，
 # 丢掉只增不减的日志节（字段变更审计、追问记录），既减 token 又更聚焦。
-_DIGEST_SECTION_KEYWORDS = ("风控结论", "结论", "经营", "财务", "事实", "风险", "信号", "待核验", "核验", "疑点")
+# "画像"必须在列：客户与企业画像章节存着法定姓名/常用称呼/企业全称——身份核验的
+# 基线。曾因不命中被整段丢掉，导致通话里客户随口报个假名，矛盾检测无从比对。
+_DIGEST_SECTION_KEYWORDS = ("风控结论", "结论", "画像", "经营", "财务", "事实", "风险", "信号", "待核验", "核验", "疑点")
 
 
 def _select_profile_sections(markdown: str) -> str:
@@ -516,6 +572,12 @@ def build_call_memory_context(
                 "不代表那件事已坐实）】\n" + tail
             )
 
+    # 上通视频通话沉淀的待核实疑点：这通电话里找自然开口温和核对（藏在闲聊里做，
+    # 别像查户口，更别提"系统/风控/记录"）。
+    open_items = open_verifications_block(enterprise_id)
+    if open_items:
+        parts.append("【此前通话沉淀的待核实疑点（找自然时机温和核对，闭合前别放过）】\n" + open_items)
+
     if not parts:
         return ""
     # 反欺诈硬约束：记忆是"客户自报、未核实"的背景，绝不能凌驾于实时画面之上——否则
@@ -530,7 +592,11 @@ def build_call_memory_context(
         "② **实时画面永远优先于记忆**：当前摄像头看到的若与记忆里客户自报的场景/身份冲突，"
         "**一律以当前画面为准**，当场用好奇、不指控的口吻核对，绝不能因为"
         "「记忆里他说过开火锅店」就附和他此刻「我在火锅店」的说法。\n"
-        "③ 记忆里你之前的附和、客套，不代表那件事已坐实，别当成已确认的结论继续沿用。）\n\n"
+        "③ 记忆里你之前的附和、客套，不代表那件事已坐实，别当成已确认的结论继续沿用。\n"
+        "④ **客户当前说法与这份记忆里已记录的口径不一致时**（姓名/称呼、企业名、金额、"
+        "用途、经营时间等），不管哪边才是真的，都要**当场温和点出不一致并请客户确认**"
+        "（「我这边记的是 X，您刚说 Y，帮我对一下哈」），核清之前沿用记忆里的口径、"
+        "**绝不默默换成客户的新说法**；客户反复更改关键信息是重要风险信号，要正面指出。）\n\n"
         + "\n\n".join(parts)
     )
 
@@ -580,6 +646,7 @@ def build_gateway_chat_turn(
     wallet_pending_block = _wallet_pending_block(enterprise_id)
     profile_digest = profile_digest_for_prompt(enterprise_id)
     wallet_facts = wallet_facts_block(enterprise_id)
+    open_verifications = open_verifications_block(enterprise_id) or "（暂无视频通话沉淀的待核实项。）"
 
     # 回归主航道：以"小微自己连续几轮没做贷款工作"为准（客户夹个关键词刷不掉）。
     # 不判断客户是否告别——只在客户给到自然开口时把没闭合的疑点带回，纯寒暄/道别则不硬塞。
@@ -655,6 +722,9 @@ def build_gateway_chat_turn(
 
 经营流水事实（系统实时汇总，做规则 3.1 里"额度/收支是否匹配"验算时以这里的数字为准，不要只信口述）：
 {wallet_facts}
+
+视频通话沉淀的待核实疑点（挂断后风控总结自动记录；按规则 3.2 跨轮咬住——客户给到自然开口时温和核对，闭合前别不了了之，但绝不对客户说"欺诈/风控/系统记录"等字眼）：
+{open_verifications}
 
 回归主航道（每轮重新判断）：
 {steer_note}

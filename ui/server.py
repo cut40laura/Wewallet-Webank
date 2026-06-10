@@ -89,6 +89,7 @@ from uploads import display_user_message, sanitize_filename, upload_metadata
 from asr import transcribe_audio
 from voicecall import call_xiaowei, mint_call_token
 from transcript_normalizer import normalize_transcript
+import video_calls
 from config import (
     VOICECALL_RELAY_HOST,
     VOICECALL_RELAY_PORT,
@@ -386,6 +387,7 @@ class Handler(BaseHTTPRequestHandler):
         "/api/wallet/pending": ("get_wallet_pending", "enterprise"),
         "/api/knowledge/status": ("get_knowledge_status", "user"),
         "/api/image-knowledge/status": ("get_image_knowledge_status", "enterprise"),
+        "/api/video-calls": ("get_video_calls", "enterprise"),
     }
     POST_ROUTES: dict[str, tuple[str, str]] = {
         "/api/auth/sms/send": ("post_auth_sms_send", "public"),
@@ -606,6 +608,10 @@ class Handler(BaseHTTPRequestHandler):
     def get_knowledge_status(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         self.send_json(KNOWLEDGE.status())
 
+    def get_video_calls(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        # 视频通话尽调留痕列表（本期"先只存不展示"，此端点供验证/调试/后续历史页）。
+        self.send_json({"calls": video_calls.list_calls(str(enterprise["id"]))})
+
     def get_image_knowledge_status(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         self.send_json(image_kb_for_enterprise(str(enterprise["id"])).status())
 
@@ -738,7 +744,32 @@ class Handler(BaseHTTPRequestHandler):
             append_messages(enterprise_id, voice_messages)
             messages = load_messages(enterprise_id)
             auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
-        self.send_json({"ok": True, "saved": len(voice_messages), "auto_profile": auto_profile})
+
+        # 尽调留痕：整通通话（转写 + relay 累积的画面观察）落库一行，风控总结
+        # 在后台线程补写——这条 INSERT 是毫秒级的，不拖慢挂断响应。
+        call_id = ""
+        observations = video_calls.drain_observations(enterprise_id)
+        contradictions = video_calls.drain_contradictions(enterprise_id)
+        if voice_messages or observations or contradictions:
+            metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+            metadata = {**metadata, "channel": "video", "turn_count": len(voice_messages)}
+            if contradictions:
+                metadata["contradictions"] = contradictions  # 实时检测明细随通话留痕
+            call_id = video_calls.record_call(
+                enterprise_id,
+                str((user or {}).get("id") or "") or None,
+                transcript=voice_messages,
+                observations=observations,
+                metadata=metadata,
+            )
+            video_calls.schedule_risk_review(
+                call_id, enterprise_id, voice_messages, observations, contradictions)
+        self.send_json({
+            "ok": True,
+            "saved": len(voice_messages),
+            "auto_profile": auto_profile,
+            "call_id": call_id,
+        })
 
     def post_chat(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         enterprise_id = str(enterprise["id"])

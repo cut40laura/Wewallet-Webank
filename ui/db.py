@@ -59,6 +59,22 @@ CREATE TABLE IF NOT EXISTS messages (
     created_ts REAL NOT NULL,
     PRIMARY KEY (enterprise_id, seq)
 );
+
+-- 视频通话尽调留痕（见 video_calls.py）：转写/画面观察/风控结论按 JSON 列存，
+-- 风格沿用 messages 的 payload。risk 由挂断后的后台线程补写。
+CREATE TABLE IF NOT EXISTS video_calls (
+    id            TEXT PRIMARY KEY,
+    enterprise_id TEXT NOT NULL,
+    user_id       TEXT,
+    started_at    TEXT,
+    ended_at      TEXT NOT NULL,
+    transcript    TEXT,
+    observations  TEXT,
+    risk          TEXT,
+    metadata      TEXT,
+    created_ts    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_calls_enterprise ON video_calls(enterprise_id, created_ts);
 """
 
 

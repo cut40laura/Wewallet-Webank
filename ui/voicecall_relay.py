@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import secrets
 import threading
 import time
@@ -60,10 +61,12 @@ from config import (
 )
 from voicecall import (
     REALTIME_INSTRUCTIONS,
+    check_contradictions,
     describe_frame,
     realtime_session_config,
     verify_call_token,
 )
+import video_calls
 
 
 async def _load_call_memory(enterprise_id: str) -> str:
@@ -213,6 +216,19 @@ class _DoubaoBridge:
         # 文本/字幕/音频帧还会陆续到达，不丢会和用户的话、和新回复交替播出（断断续续+冲突）。
         # 从发出打断起置位，ASR_ENDED（用户说完，新回复在它之后才来）清除。
         self.discard_old_turn = False
+        # ── 实时矛盾检测（口述 vs 档案，确定性旁路）状态 ──
+        # 接通时把开场记忆原文也留一份当"已知档案"基线；每句 ASR 定稿触发一次后台比对
+        # （线程池跑、单飞 + 只保最新待查，绝不卡音频转发），命中则前端弹警示块 +
+        # 静默注入核对提示 + 登记到挂断风控。
+        self.memory_text = ""
+        self.current_utterance = ""  # 当前这段语音的 ASR 累积全文（每帧带全量，覆盖即可）
+        self.recent_turns: list[tuple[str, str]] = []  # 最近几轮 (角色, 文本)，比对时当上下文
+        self.ai_turn_text = ""  # 本轮 AI 字幕累积（进 recent_turns 用）
+        self.contradiction_in_flight = False
+        self.pending_check_utterance = ""  # 在途时新句子只保最新一条，不排队不并发
+        self.contradiction_keys: set[str] = set()  # field|known 去重（整通范围）
+        self.pending_risk_hint = ""  # 待静默注入的核对提示（与画面注入共用 flush 通道）
+        self.alerted_anomalies: set[str] = set()  # 已弹过的画面疑点指纹（整通范围）
 
 
 # 吞画面复述的【兜底】时限：正常解除靠"复述那轮 TTS_ENDED"（生命周期吞），这个时限只防
@@ -226,6 +242,36 @@ _SUPPRESS_FALLBACK_S = 20.0
 _VISION_REFRESH_S = 12.0
 
 
+def _fresh_anomalies(bridge: Any, observation: dict[str, Any] | None) -> list[str]:
+    """从一帧观察里挑出**这通还没弹过**的画面疑点，供前端弹警示块。
+
+    视觉模型每帧重新生成 anomaly 文案，措辞会微抖（"相关经营场所"vs"相关场所"），
+    逐字去重失效、同一疑点反复弹。指纹取归一化后的前 12 字：措辞抖动几乎都在尾部，
+    头部（"场景为宿舍非小微企业…"）稳定。整通范围去重。
+    """
+    if not isinstance(observation, dict):
+        return []
+    fresh: list[str] = []
+    for raw in observation.get("anomalies") or []:
+        text = str(raw).strip()
+        fingerprint = re.sub(r"[\W_]+", "", text)[:12]
+        if text and fingerprint and fingerprint not in bridge.alerted_anomalies:
+            bridge.alerted_anomalies.add(fingerprint)
+            fresh.append(text)
+    return fresh
+
+
+async def _notify_visual_risks(bridge: Any, observation: dict[str, Any] | None) -> None:
+    """新出现的画面疑点推给前端弹警示块（risk.visual）；没新的不发，绝不抛错。"""
+    fresh = _fresh_anomalies(bridge, observation)
+    if not fresh:
+        return
+    try:
+        await bridge.browser.send(json.dumps({"type": "risk.visual", "items": fresh}))
+    except Exception:
+        pass
+
+
 async def _flush_pending_vision(bridge: _DoubaoBridge) -> None:
     """空闲时把待注入的画面文字发给豆包（静默：吞掉它触发的复述）。
 
@@ -236,12 +282,15 @@ async def _flush_pending_vision(bridge: _DoubaoBridge) -> None:
     画面（含人物外观/场景/证件）就这样静默进上下文；用户问"你长什么样""我手里这是什么"时，
     她的**音频轮回复直接用上下文作答**（那条不在吞窗内、正常播），无需对画面注入特殊放行。
     """
-    if not bridge.pending_vision:
+    if not bridge.pending_vision and not bridge.pending_risk_hint:
         return
     if bridge.ai_speaking or bridge.user_turn_active or bridge.awaiting_reply:
         return  # 不空闲（在播 / 用户在说 / 等回复间隙），先攒着
-    content = bridge.pending_vision
+    # 画面与风控核对提示共用这条静默注入通道：合成一条 ChatTextQuery，一次吞一轮复述。
+    parts = [p for p in (bridge.pending_vision, bridge.pending_risk_hint) if p]
+    content = "\n".join(parts)
     bridge.pending_vision = None
+    bridge.pending_risk_hint = ""
     # 吞掉这条触发的复述：到它的 TTS_ENDED 为止（生命周期吞），时限只是丢帧兜底。
     bridge.suppress_until = time.monotonic() + _SUPPRESS_FALLBACK_S
     _dbg(f"FLUSH 注入画面+设 suppress（至复述 TTS_ENDED，兜底 {_SUPPRESS_FALLBACK_S}s）| content={content[:60]!r}")
@@ -271,6 +320,9 @@ async def _inject_vision_doubao(bridge: _DoubaoBridge, frame: str) -> None:
         }))
     except Exception:
         pass
+    # 尽调留痕：观察登记进进程内登记簿（纯内存 append），挂断时随转写一起落库。
+    video_calls.note_observation(bridge.enterprise_id, observation)
+    await _notify_visual_risks(bridge, observation)  # 新画面疑点→前端警示块（整通去重）
     base = _caption_with_scene(caption, observation)  # 含"有没有人/几个人/场景"硬事实
     hint = _verify_hint(observation)  # 反欺诈核验内部指引（绝不读出），有则折进静默注入
     content = base + ("\n" + hint if hint else "")
@@ -295,6 +347,69 @@ async def _vision_task_doubao(bridge: _DoubaoBridge, frame: str) -> None:
         bridge.vision_in_flight = False
 
 
+def _maybe_schedule_contradiction_check(bridge: _DoubaoBridge, utterance: str) -> None:
+    """一句 ASR 定稿后调度一次"口述 vs 档案"比对（确定性旁路）。
+
+    性能护栏：①没档案/短句（寒暄"嗯/好的"）直接跳过；②单飞——在途时新句子只
+    覆盖"最新待查"，绝不并发、绝不排队堆积；③真正的网络比对丢线程池跑
+    （check_contradictions 阻塞 requests），不碰音频转发协程。
+    """
+    utterance = (utterance or "").strip()
+    # 阈值 4：拦下"嗯/好的/对对对"这类纯应答，但放过"我叫麦子"这种 4 字身份自报
+    # （曾设 6 把它拦掉了，名字与档案不符就漏检）。
+    if not bridge.memory_text or len(utterance) < 4:
+        return
+    if bridge.contradiction_in_flight:
+        bridge.pending_check_utterance = utterance  # 只保最新，过时的不值得查
+        return
+    bridge.contradiction_in_flight = True
+    asyncio.create_task(_contradiction_task_doubao(bridge, utterance))
+
+
+async def _contradiction_task_doubao(bridge: _DoubaoBridge, utterance: str) -> None:
+    """后台比对一次：命中 → 前端弹警示块 + 静默注入核对提示 + 登记进挂断风控。"""
+    try:
+        loop = asyncio.get_running_loop()
+        recent = "\n".join(f"{role}：{text}" for role, text in bridge.recent_turns[-6:])
+        items = await loop.run_in_executor(
+            None, check_contradictions, bridge.memory_text, utterance, recent)
+        for item in items:
+            key = f"{item.get('field', '')}|{item.get('known', '')}"
+            if key in bridge.contradiction_keys:
+                continue  # 同一处出入整通只报一次，别轰炸
+            bridge.contradiction_keys.add(key)
+            _dbg(f"CONTRADICTION 命中 {item}")
+            # ① 登记到挂断风控（与画面观察同一登记簿机制，挂断时合入风控判级+待核验点）。
+            video_calls.note_contradiction(bridge.enterprise_id, item)
+            # ② 通知前端在通话 UI 弹红色警示块。
+            try:
+                await bridge.browser.send(json.dumps({"type": "risk.contradiction", "item": item}))
+            except Exception:
+                pass
+            # ③ 静默注入核对提示，引导小微接下来自然、不指控地当场核对。
+            hint = (
+                "（风控提示，仅你自己看、绝不要读出来也不要说'系统提示'：用户刚才的说法"
+                f"与已知档案不符——{item.get('field') or '某项信息'}：用户说\"{item.get('stated', '')}\"，"
+                f"但档案里是\"{item.get('known', '')}\"。你【必须在下一次回应里当场点出这处"
+                "不一致并请用户确认，绝不顺着用户的新说法走、绝不改用新口径】（涉及姓名时"
+                "更不要改口称呼）；口吻自然、给台阶但事实要摆出来"
+                + (f"，例如：\"{item['nudge']}\"" if item.get("nudge") else "")
+                + "。核清之前一律沿用档案口径。）"
+            )
+            bridge.pending_risk_hint = (
+                bridge.pending_risk_hint + "\n" + hint if bridge.pending_risk_hint else hint)
+        if items:
+            await _flush_pending_vision(bridge)  # 空闲就立刻注入，不空闲攒着等 TTS_ENDED
+    except Exception:
+        pass
+    finally:
+        bridge.contradiction_in_flight = False
+        # 在途期间又有新句子定稿：补查最新那条（递归只一层深，单飞闸门仍然有效）。
+        pending, bridge.pending_check_utterance = bridge.pending_check_utterance, ""
+        if pending:
+            _maybe_schedule_contradiction_check(bridge, pending)
+
+
 async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
     async for raw in bridge.upstream:
         if not isinstance(raw, (bytes, bytearray)):
@@ -316,6 +431,12 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
             if bridge.suppress_until > time.monotonic():
                 _dbg("  -> ASR_RESPONSE 清除 suppress")
             bridge.suppress_until = 0.0
+            # 矛盾检测旁路：ASR 每帧带本段累积全文，覆盖记录即可（定稿在 ASR_ENDED）。
+            _text = "".join(
+                item.get("text", "") for item in ((frame.json or {}).get("results") or [])
+                if isinstance(item, dict) and item.get("text"))
+            if _text:
+                bridge.current_utterance = _text
 
         suppressing = bridge.suppress_until > time.monotonic()
         if suppressing and frame.event in (dbq.EVENT_CHAT_RESPONSE, dbq.EVENT_TTS_SUBTITLE):
@@ -345,6 +466,16 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
         elif frame.event == dbq.EVENT_TTS_ENDED:
             bridge.ai_speaking = False
             bridge.awaiting_reply = False  # 这轮回复播完，"等回复"间隙结束，可以安全 flush 画面了
+            # 矛盾检测旁路：小微这轮说完，进上下文窗口（被吞的画面复述轮 ai_turn_text 为空，自然跳过）。
+            if bridge.ai_turn_text:
+                bridge.recent_turns.append(("经理", bridge.ai_turn_text))
+                del bridge.recent_turns[:-8]
+                bridge.ai_turn_text = ""
+
+        # 矛盾检测旁路：累积小微本轮字幕当上下文（吞复述/丢旧轮的帧不算她对客户说的话）。
+        if (frame.event == dbq.EVENT_TTS_SUBTITLE and not suppressing
+                and not bridge.discard_old_turn and (frame.json or {}).get("text")):
+            bridge.ai_turn_text += str(frame.json["text"])
 
         # 用户语音"起点"才动作一次：通知前端停播+截帧（speech_started），并在 AI 正说时打断她。
         # 整段语音的后续 interim 帧都跳过——否则几十个 interim 会把小微反复掐断。
@@ -362,6 +493,12 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
             bridge.user_turn_active = False  # 本段用户语音结束，下段重新允许起点动作
             bridge.awaiting_reply = True  # 真实回复马上要来，进入"等回复"间隙，禁 flush
             bridge.discard_old_turn = False  # 旧轮残留早已排干（打断在这句话开头），恢复转发新回复
+            # 矛盾检测旁路：这句定稿了，进上下文窗口 + 调度一次后台比对（单飞、不卡音频）。
+            utterance, bridge.current_utterance = bridge.current_utterance, ""
+            if utterance:
+                bridge.recent_turns.append(("用户", utterance))
+                del bridge.recent_turns[:-8]
+                _maybe_schedule_contradiction_check(bridge, utterance)
 
         # 只在 TTS_ENDED（她真说完、用户也没在说）flush 画面。【不在 CHAT_ENDED】：那时 TTS
         # 还在播，suppress 会切掉尾音。【也不在 ASR_ENDED】：用户刚说完、真实回复 ~1s 后就到，
@@ -377,6 +514,7 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
             system_role = REALTIME_INSTRUCTIONS
             if memory:
                 system_role = f"{REALTIME_INSTRUCTIONS}\n\n{memory}"
+                bridge.memory_text = memory  # 同一份记忆留作矛盾检测的"已知档案"基线
                 _dbg(f"注入开场记忆 {len(memory)} 字（enterprise={bridge.enterprise_id}）")
             session_cfg = dbq.build_session_config(
                 system_role,
@@ -470,11 +608,13 @@ async def _handle_doubao(browser: Any, enterprise_id: str = "") -> None:
 class _StepBridge:
     """一条浏览器⇄StepFun 连接的共享状态。"""
 
-    def __init__(self, browser: Any, upstream: Any) -> None:
+    def __init__(self, browser: Any, upstream: Any, enterprise_id: str = "") -> None:
         self.browser = browser
         self.upstream = upstream
+        self.enterprise_id = enterprise_id  # 该通话所属企业，用于观察留痕
         self.last_vision_desc = ""
         self.vision_in_flight = False  # 看画面任务在途（单飞闸门）
+        self.alerted_anomalies: set[str] = set()  # 已弹过的画面疑点指纹（整通范围）
 
 
 async def _inject_vision_step(bridge: _StepBridge, frame: str) -> None:
@@ -493,6 +633,9 @@ async def _inject_vision_step(bridge: _StepBridge, frame: str) -> None:
         }))
     except Exception:
         pass
+    # 尽调留痕：观察登记进进程内登记簿（去重前登记，每帧观察都留痕）。
+    video_calls.note_observation(bridge.enterprise_id, observation)
+    await _notify_visual_risks(bridge, observation)  # 新画面疑点→前端警示块（整通去重）
     if caption == bridge.last_vision_desc:
         return
     bridge.last_vision_desc = caption
@@ -554,7 +697,7 @@ async def _handle_stepfun(browser: Any, enterprise_id: str = "") -> None:
         if memory:
             _dbg(f"注入开场记忆 {len(memory)} 字（enterprise={enterprise_id}）")
         await upstream.send(json.dumps({"type": "session.update", "session": realtime_session_config(memory)}))
-        bridge = _StepBridge(browser, upstream)
+        bridge = _StepBridge(browser, upstream, enterprise_id)
         up = asyncio.create_task(_pump_step_upstream(bridge))
         down = asyncio.create_task(_pump_step_browser(bridge))
         _done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
