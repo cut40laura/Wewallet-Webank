@@ -1,7 +1,7 @@
 # 设计：长程业务一致性反欺诈（视频通话）
 
 > 日期：2026-06-10
-> 状态：待评审（已吸收 Codex 第一轮审查的 8 条意见，v2）
+> 状态：待评审（v3：已吸收 Codex 第一轮 8 条 + 第二轮 4 条意见）
 > 涉及：`ui/static/chat.js`、`realtime/doubao-realtime-proxy.mjs`、`ui/server.py`（reason 分类）
 
 ## 1. 背景与问题
@@ -137,11 +137,15 @@ businessClaimEvents: []  // [ { field, value, raw, ts, seq, event_type } ]
 
 **串行队列设计**：
 - `videoCall.businessQueue = []`（待处理 utterance）、`videoCall.businessBusy = false`（是否有请求在途）。
-- `videoScheduleContradictionCheck` 去抖回调里，把本轮 utterance **入队**，触发 `videoDrainBusinessQueue()`。
+- **唯一入口** `videoEnqueueBusinessCheck(text, utteranceId)`：把 utterance 入队并返回一个 promise（在该 utterance 的检测完成、结果采纳后 resolve，携带其 `contradictions`），随后触发 `videoDrainBusinessQueue()`。**所有触发方都走这个入口**，不各自发请求。
 - `videoDrainBusinessQueue`：若 `businessBusy` 则直接返回（在途请求完成后会自驱继续）；否则取队首，用**当前最新** `videoCall.businessLedger` 组装请求并发出，置 `businessBusy=true`。
-- 响应返回：先用最新账本采纳结果（见下），再 `businessBusy=false`、若队列非空则继续 `videoDrainBusinessQueue()`。
+- 响应返回：先用最新账本采纳结果（见下），resolve 该 utterance 的 promise，再 `businessBusy=false`、若队列非空则继续 `videoDrainBusinessQueue()`。
 - 这样每条 utterance **按入队顺序、用处理时刻的最新账本** 依次处理，既不乱序也不丢主张。`seq` 仅作日志/调试用途，不再承担正确性。
 - 队列上限（如 8 条）防异常堆积；超限丢弃最旧的非业务噪声。
+
+**防双触发去重（点：文字/语音两条触发路径）**：业务检测可能被两处触发——语音 ASR 经 `videoScheduleContradictionCheck` 去抖、文字经 `videoSendText`。两者**共用 `videoEnqueueBusinessCheck` 这一个入口**，并对队列**按 `utteranceId` 去重**（同一句已在队列/在途则不重复入队，复用同一个 promise）。
+- **语音路径**：`videoScheduleContradictionCheck` 去抖回调里 fire-and-forget 调用 `videoEnqueueBusinessCheck(utterance, id)`（不 await）。
+- **文字路径**：`videoSendText` 直接 `await videoEnqueueBusinessCheck(text, id)` 拿到该句 `contradictions`，再把升级话术拼进 `/api/video-chat` messages（§4.6）；**且不再为同一句额外走去抖入队**（同一 `utteranceId` 已被去重，即使误触也是 no-op）。
 
 **采纳规则**：
 - `is_business=false` **或** `claim_events` 为空：**不改动本地账本**（§4.2 已约束 `updated_ledger==ledger`），不触发核验/nudge。
@@ -174,7 +178,7 @@ businessClaimEvents: []  // [ { field, value, raw, ts, seq, event_type } ]
 业务矛盾命中且（`emotional_pressure` 或状态升级）时，按状态生成升级提示，但**两个通道注入方式不同**：
 
 - **实时语音通道**：经 `videoCall.client.sendContext(...)` 注入实时 WebSocket 上下文。代理的现有行为是：**AI 正在播报时缓存到该句播完(TTSEnded)再喂；空闲时立即静默喂入并吞掉该轮播报**——因此 nudge 不会打断正在播的语音，只 steer 下一句。
-- **文字通道（`/api/video-chat`）**：`sendContext` 对它**无效**（它是另起 HTTP 流式请求）。因此 `videoSendText` 必须**先 await 业务检测**，若返回 business 矛盾，把升级话术作为一条 `parts` 拼进 `/api/video-chat` 的 messages（与现有把"视觉摘要/知识库"拼进 messages 同理），本次文字回复才会体现。代价是文字回复前多一次抽取往返延迟——贷款审批场景可接受。
+- **文字通道（`/api/video-chat`）**：`sendContext` 对它**无效**（它是另起 HTTP 流式请求）。因此 `videoSendText` 必须 `await videoEnqueueBusinessCheck(text, id)`（§4.3 的统一入口）拿到该句 `contradictions`，若有 business 矛盾，把升级话术作为一条 `parts` 拼进 `/api/video-chat` 的 messages（与现有把"视觉摘要/知识库"拼进 messages 同理），本次文字回复才会体现。代价是文字回复前多一次抽取往返延迟——贷款审批场景可接受。
 
 升级话术（两通道共用文案，按状态分级）：
 - `challenged`：`（风控提示：用户业务说法前后不一致——<field>：<known> → <stated>。共情一句，但务必自然指出这处出入，请其确认或解释。）`
@@ -209,6 +213,7 @@ businessClaimEvents: []  // [ { field, value, raw, ts, seq, event_type } ]
 
 - **单元（纯函数，node 脚本）**：业务状态机推进/`outstanding` 去升级/`flagged` 只落一次（仿 `sceneDeception` 已有单测）；账本合并与"未提及≠矛盾"、单位归一化、字段级矛盾判定。
 - **串行队列**：连续两句业务发言（第二句在第一句返回前入队），校验第二句用的是第一句更新后的账本（能识别 500→1000），且两句的主张都不丢、按序处理。
+- **防双触发去重**：同一句既经语音去抖、又经文字发送触发时，校验只产生一次抽取请求（按 `utteranceId` 去重、复用同一 promise）。
 - **接口（mock LLM 或固定样例）**：给定 ledger+utterance，校验出参 schema、`contradictions` 为规范形、失败时保守返回。
 - **落库链路**：构造一条 `kind:"business_integrity"` flagged 矛盾，校验 `videoMergeContradictions` 生成业务 reason（不是画面欺骗文案）、`risk.level=high`、`risk.business_claim_events` 落库。
 - **端到端（人工）**："500万→（隔 20+ 轮）→1000万 + 装生气"用例：①弹业务不一致并升级、②AI 共情但坚持要材料不松动、③挂断后 risk.level=high 且审计快照含变卦痕迹。
@@ -217,9 +222,9 @@ businessClaimEvents: []  // [ { field, value, raw, ts, seq, event_type } ]
 
 - `ui/static/chat.js`：
   - `videoCall.businessLedger` / `businessClaimEvents` / `businessIntegrity` / `businessQueue` / `businessBusy` 字段与 `openVideoCall` 重置；
-  - `videoRunBusinessCheck` + `videoDrainBusinessQueue`（串行队列，用最新账本逐句处理）；`videoScheduleContradictionCheck` 接入；
+  - `videoEnqueueBusinessCheck`（唯一可 await 入口 + `utteranceId` 去重）+ `videoDrainBusinessQueue`（串行队列，用最新账本逐句处理）；`videoScheduleContradictionCheck` 接入（fire-and-forget 调用入口）；
   - 业务升级状态机；
-  - `videoSendText` 文字通道：await 业务检测并把升级话术拼进 `/api/video-chat` messages（§4.6）；
+  - `videoSendText` 文字通道：`await videoEnqueueBusinessCheck`，把升级话术拼进 `/api/video-chat` messages（§4.6）；
   - `videoMergeContradictions`：high reason 按 `kind` 生成（§4.7）；
   - 落档处写入 `risk.business_ledger` 与 `risk.business_claim_events`。
 - `realtime/doubao-realtime-proxy.mjs`：新增 `/api/business-claim-check`（temperature=0、字段白名单、归一化、失败保守）；`VIDEO_SYSTEM_ROLE` 与 `VIDEO_CHAT_SYSTEM_PROMPT` 加"业务不让步"规则。
