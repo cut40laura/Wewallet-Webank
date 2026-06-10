@@ -140,8 +140,9 @@ businessClaimEvents: []  // [ { field, value, raw, ts, seq, event_type } ]
 - **唯一入口** `videoEnqueueBusinessCheck(text, utteranceId)`：把 utterance 入队并返回一个 promise（在该 utterance 的检测完成、结果采纳后 resolve，携带其 `contradictions`），随后触发 `videoDrainBusinessQueue()`。**所有触发方都走这个入口**，不各自发请求。
 - `videoDrainBusinessQueue`：若 `businessBusy` 则直接返回（在途请求完成后会自驱继续）；否则取队首，用**当前最新** `videoCall.businessLedger` 组装请求并发出，置 `businessBusy=true`。
 - 响应返回：先用最新账本采纳结果（见下），resolve 该 utterance 的 promise，再 `businessBusy=false`、若队列非空则继续 `videoDrainBusinessQueue()`。
+- **失败路径（必须）**：接口非 2xx、fetch 异常、JSON 解析失败、schema 校验不过等，一律把该 utterance 的 promise **以空结果 resolve**（`{contradictions:[]}`，绝不 reject——否则 `videoSendText` 的 await 会挂住或抛错）；`businessBusy=false`、续 drain 全部放在 `finally` 里，保证队列不卡死、后续句子能继续处理。
 - 这样每条 utterance **按入队顺序、用处理时刻的最新账本** 依次处理，既不乱序也不丢主张。`seq` 仅作日志/调试用途，不再承担正确性。
-- 队列上限（如 8 条）防异常堆积；超限丢弃最旧的非业务噪声。
+- 队列上限（如 8 条）防异常堆积。**入队时尚未跑抽取，无法判断是否业务**，所以超限时丢弃**最旧的未开始项**（不动已在途项），并把被丢项的 promise **以空结果 resolve**（`{contradictions:[]}`），避免其 await 方卡住。可选优化：入队前用极简关键词（金额/借/万/厂房/设备…）粗筛，明显闲聊的不入队。
 
 **防双触发去重（点：文字/语音两条触发路径）**：业务检测可能被两处触发——语音 ASR 经 `videoScheduleContradictionCheck` 去抖、文字经 `videoSendText`。两者**共用 `videoEnqueueBusinessCheck` 这一个入口**，并对队列**按 `utteranceId` 去重**（同一句已在队列/在途则不重复入队，复用同一个 promise）。
 - **语音路径**：`videoScheduleContradictionCheck` 去抖回调里 fire-and-forget 调用 `videoEnqueueBusinessCheck(utterance, id)`（不 await）。
@@ -214,6 +215,7 @@ businessClaimEvents: []  // [ { field, value, raw, ts, seq, event_type } ]
 - **单元（纯函数，node 脚本）**：业务状态机推进/`outstanding` 去升级/`flagged` 只落一次（仿 `sceneDeception` 已有单测）；账本合并与"未提及≠矛盾"、单位归一化、字段级矛盾判定。
 - **串行队列**：连续两句业务发言（第二句在第一句返回前入队），校验第二句用的是第一句更新后的账本（能识别 500→1000），且两句的主张都不丢、按序处理。
 - **防双触发去重**：同一句既经语音去抖、又经文字发送触发时，校验只产生一次抽取请求（按 `utteranceId` 去重、复用同一 promise）。
+- **失败/超限不卡死**：mock 接口失败、fetch 抛错、队列超限三种情况，校验对应 promise 都以空结果 resolve、`businessBusy` 在 `finally` 归零、队列继续 drain，`videoSendText` 的 await 能正常返回。
 - **接口（mock LLM 或固定样例）**：给定 ledger+utterance，校验出参 schema、`contradictions` 为规范形、失败时保守返回。
 - **落库链路**：构造一条 `kind:"business_integrity"` flagged 矛盾，校验 `videoMergeContradictions` 生成业务 reason（不是画面欺骗文案）、`risk.level=high`、`risk.business_claim_events` 落库。
 - **端到端（人工）**："500万→（隔 20+ 轮）→1000万 + 装生气"用例：①弹业务不一致并升级、②AI 共情但坚持要材料不松动、③挂断后 risk.level=high 且审计快照含变卦痕迹。
