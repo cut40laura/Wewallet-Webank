@@ -51,6 +51,8 @@ LLM 抽取返回：
 }
 ```
 
+**v1 范围（明确）：** 自我变卦检测覆盖 `loan_total / allocations.* / industry / business_data.*`（金额或数值变化、行业自我改口）。**`partners`（合作方）本期只留痕、不判矛盾**——"美业却称与英伟达合作"属"业务合理性/交易背景"，需行业知识/档案，spec 已划为范围外。因此**完成标准与端到端用例都不要求"合作方自我变卦"**；partners 仅作为 `initial` 事件落档供人工参考。后续若要做"明确否定/替换合作方"再单列议题。
+
 ---
 
 ## Task 1: 纯函数 `business-claims.mjs` — 金额归一化 + 合并比对
@@ -382,29 +384,39 @@ async function handleBusinessClaimCheck(req, res) {
 
 - [ ] **Step 4: 复用/抽出 ARK 文本调用助手**
 
-检查 `/api/contradiction-check` 里调用 ARK 的代码：若已有可复用的"发 prompt+user、拿 JSON 字符串"函数，直接用其名替换上面的 `arkChatJson`。若没有，照其实现抽出一个：
+`/api/contradiction-check`（约 line 224）已有现成的"文本模型 + `${baseUrl}/chat/completions`"调用，模型用 `ARK_TEXT_MODEL || ARK_VISION_MODEL || "doubao-seed-2-0-mini-260428"`。**优先复用它已有的助手**（DRY）；若没有抽成函数，照下面抽一个——**必须用文本模型解析，绝不用 `resolveVisionProvider()`**（那是视觉模型，会导致文本抽取走错模型）：
 ```js
+// ARK 文本模型解析：与 /api/contradiction-check 一致；不依赖视觉模型。
+function resolveArkTextProvider() {
+  const apiKey = process.env.ARK_API_KEY;
+  if (!apiKey) return null; // 无凭证 → 上层保守降级
+  return {
+    apiKey,
+    baseUrl: (process.env.ARK_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3").replace(/\/+$/, ""),
+    model: process.env.ARK_TEXT_MODEL || process.env.ARK_VISION_MODEL || "doubao-seed-2-0-mini-260428",
+  };
+}
 // 发一次 ARK 文本对话，temperature=0，返回 assistant 文本（可能含 JSON）。失败抛错。
 async function arkChatJson(systemPrompt, userText) {
-  const cfg = resolveVisionProvider(); // 现有：解析 ARK/QWEN 凭证
-  if (!cfg || cfg.provider !== "ark") throw new Error("no ark");
+  const cfg = resolveArkTextProvider();
+  if (!cfg) throw new Error("no ARK_API_KEY");
   const resp = await fetch(`${cfg.baseUrl}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
     body: JSON.stringify({
-      model: process.env.ARK_TEXT_MODEL || cfg.model,
+      model: cfg.model,
       temperature: 0,
       messages: [ { role: "system", content: systemPrompt }, { role: "user", content: userText } ],
     }),
   });
   if (!resp.ok) throw new Error(`ark ${resp.status}`);
   const data = await resp.json();
-  let text = data.choices?.[0]?.message?.content || "";
+  const text = data.choices?.[0]?.message?.content || "";
   const m = text.match(/\{[\s\S]*\}/); // 容错：抽出第一个 JSON 块
   return m ? m[0] : text;
 }
 ```
-> 注意：如果现有 `/api/contradiction-check` 已有同等函数（如 `arkText`/`callArk`），**用现有的，别新增重复**（DRY）。确认 `readJsonBody`/`sendJson` 是现有助手名；若名字不同，按现有命名替换。
+> 确认 `readJsonBody`/`sendJson` 是现有助手名；若名字不同，按现有命名替换。`handleBusinessClaimCheck` 里凡 `arkChatJson` 抛错（含无凭证）都被 `catch` 走 `safe()` 保守返回（见 Step 3）。
 
 - [ ] **Step 5: 语法检查 + 手测端点**
 
@@ -417,7 +429,21 @@ sleep 2
 curl -s -X POST http://127.0.0.1:8870/api/business-claim-check -H 'Content-Type: application/json' \
   -d '{"ledger":{"loan_total":{"value":500,"unit":"万","raw":"500万","ts":1},"allocations":{},"industry":null,"partners":[],"business_data":{}},"utterance":"其实我要借1000万","recent":"","seq":1}'
 ```
-Expected: 返回 JSON，`contradictions` 含 `业务不一致·借款金额`（若 ARK 凭证可用）；ARK 不可用时保守返回空（`is_business:false`）。
+Expected: 返回 JSON，`contradictions` 含 `业务不一致·借款金额`（若 ARK 凭证可用）。
+
+**失败保守验收（必须全部满足，均返回 HTTP 200 + 空结果 + 原样 ledger，绝不阻塞/报错）：**
+- 无 `ARK_API_KEY`（临时 `ARK_API_KEY= node …` 起代理）：任意业务句 → `{is_business:false, contradictions:[], updated_ledger==入参ledger}`。
+- 空 utterance：`-d '{"ledger":{...},"utterance":"","seq":2}'` → 同上保守返回。
+- 坏 JSON 请求体：`-d 'not-json'` → HTTP 400（`bad json`），不崩进程。
+- 模型返回非 JSON（无法本地直接造，靠代码保证）：`JSON.parse` 抛错被 `catch` → `safe()`。
+验证命令示例：
+```bash
+curl -s -o /dev/null -w "empty utt: %{http_code}\n" -X POST http://127.0.0.1:8870/api/business-claim-check \
+  -H 'Content-Type: application/json' -d '{"ledger":{"loan_total":null,"allocations":{},"industry":null,"partners":[],"business_data":{}},"utterance":"","seq":2}'
+curl -s -o /dev/null -w "bad json: %{http_code}\n" -X POST http://127.0.0.1:8870/api/business-claim-check \
+  -H 'Content-Type: application/json' -d 'not-json'
+```
+Expected: `empty utt: 200`、`bad json: 400`。
 
 - [ ] **Step 6: Commit**
 
@@ -470,8 +496,11 @@ Create `ui/static/business-ledger.test.mjs`:
 ```js
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import mod from "./business-ledger.js";
-const { createBusinessIntegrity } = mod;
+import { createRequire } from "node:module";
+// business-ledger.js 是浏览器可用的普通 .js（CommonJS 双导出）。根目录无 package.json，
+// 默认按 CJS 处理；用 createRequire 稳妥加载，避免未来若加了 "type":"module" 时 ESM 默认导入失效。
+const require = createRequire(import.meta.url);
+const { createBusinessIntegrity } = require("./business-ledger.js");
 
 test("连续3条业务矛盾 → flagged，只产出一次 flagged finding", () => {
   const s = createBusinessIntegrity();
@@ -644,7 +673,7 @@ git commit -m "feat(antifraud): business-integrity escalation state machine (pur
   businessIntegrity: null,        // createBusinessIntegrity() 实例，openVideoCall 时建
   businessQueue: [],              // [{text, id, resolve, promise}]
   businessBusy: false,
-  skipNextVoiceBusiness: false,   // 文字发送时置真，让紧随的去抖回调跳过"语音业务入队"，避免同句双查
+  recentTextBizUtterances: [],    // [{text, at}] 文字路径已发起业务检测的句子，供语音去抖按内容去重（避免同句双查）
 ```
 
 - [ ] **Step 3: chat.js 加空账本工厂 + openVideoCall 重置**
@@ -662,6 +691,7 @@ function emptyBusinessLedger() {
   videoCall.businessIntegrity = window.BusinessLedger.createBusinessIntegrity();
   videoCall.businessQueue = [];
   videoCall.businessBusy = false;
+  videoCall.recentTextBizUtterances = [];
 ```
 
 - [ ] **Step 4: 语法检查 + Commit**
@@ -788,12 +818,13 @@ function videoApplyBusinessResult(contradictions, clarified, emotionalPressure) 
 
 - [ ] **Step 2: 去抖回调接入（语音路径 fire-and-forget）**
 
-在 `videoScheduleContradictionCheck` 的 setTimeout 回调里，现有 `videoCheckSceneMismatch(utterance)` 之后追加（用 `skipNextVoiceBusiness` 防与文字路径同句双查）：
+在 `videoScheduleContradictionCheck` 的 setTimeout 回调里，现有 `videoCheckSceneMismatch(utterance)` 之后追加（按**文本内容**去重，避免与文字路径同句双查；比一次性布尔更稳，不会误跳过别的句子）：
 ```js
-    if (videoCall.skipNextVoiceBusiness) {
-      videoCall.skipNextVoiceBusiness = false; // 本句已由文字路径检测，跳过
-    } else {
-      videoEnqueueBusinessCheck(utterance, `voice-${Date.now()}`); // 语音：fire-and-forget
+    const __u = (utterance || "").trim();
+    const __now = Date.now();
+    videoCall.recentTextBizUtterances = videoCall.recentTextBizUtterances.filter((e) => __now - e.at < 5000);
+    if (!videoCall.recentTextBizUtterances.some((e) => e.text === __u)) {
+      videoEnqueueBusinessCheck(utterance, `voice-${__now}`); // 语音：fire-and-forget（本句未被文字路径检测过）
     }
 ```
 
@@ -801,11 +832,11 @@ function videoApplyBusinessResult(contradictions, clarified, emotionalPressure) 
 
 **必须先启动、后 await**，否则有竞态：`videoSendText` 在顶部就调 `videoScheduleContradictionCheck()`（去抖 1.4s），而 await 若放在知识库检索之后（可能 >1.4s），去抖已触发 → 同句双查。所以分两步：
 
-3a. 在 `videoSendText` 顶部，**在现有 `videoCall.pendingUtterance += text; videoScheduleContradictionCheck();` 之前**，插入（先置 skip 标志、先把业务检测发出去拿到 promise，但不在此 await）：
+3a. 在 `videoSendText` 顶部，**在现有 `videoCall.pendingUtterance += text; videoScheduleContradictionCheck();` 之前**，插入（先登记本句文本、发起业务检测拿到 promise，但不在此 await）：
 ```js
   // 文字通道：sendContext 对它无效，业务核验话术要直接拼进 /api/video-chat。
-  // 先置 skip 标志并发起业务检测，确保早于下面的 videoScheduleContradictionCheck 去抖，避免同句双查。
-  videoCall.skipNextVoiceBusiness = true;
+  // 先登记本句文本（供语音去抖按内容去重）并发起业务检测，确保早于下面的 videoScheduleContradictionCheck 去抖。
+  videoCall.recentTextBizUtterances.push({ text: (text || "").trim(), at: Date.now() });
   const __bizPromise = videoEnqueueBusinessCheck(text, `text-${Date.now()}`);
 ```
 
@@ -827,7 +858,7 @@ function videoApplyBusinessResult(contradictions, clarified, emotionalPressure) 
 ```js
     if (bizNudge) parts.push(bizNudge);
 ```
-> 去重说明：`videoScheduleContradictionCheck()`（档案/场景检测）保留；业务检测只走 3a 的 promise。3a 先于顶部的 `videoScheduleContradictionCheck()` 执行，置好 `skipNextVoiceBusiness`，使 Step 2 去抖回调跳过本句的语音业务入队——同句只查一次，且不受知识库检索耗时影响。
+> 去重说明：`videoScheduleContradictionCheck()`（档案/场景检测）保留；业务检测只走 3a 的 promise。3a 先于顶部的 `videoScheduleContradictionCheck()` 执行，把本句文本登记进 `recentTextBizUtterances`，使 Step 2 去抖回调按**内容**判定本句已检测、跳过语音业务入队——同句只查一次，不受知识库检索耗时影响，也不会误跳过其它句子。
 
 - [ ] **Step 4: `videoMergeContradictions` 的 high reason 按 kind 分类**
 
