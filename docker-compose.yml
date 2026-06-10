@@ -34,12 +34,10 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # TLS 由 Caddy 在边缘终止，容器内始终 http/ws，无需证书。
     environment:
       DOUBAO_REALTIME_PROXY_HOST: 0.0.0.0
       DOUBAO_REALTIME_PROXY_PORT: "8870"
-      # Caddy 负责公网 HTTPS/wss 终止；容器内保持 http/ws，避免 Caddy 反代 502。
-      DOUBAO_REALTIME_PROXY_TLS_CERT: ""
-      DOUBAO_REALTIME_PROXY_TLS_KEY: ""
     expose:
       - "8870"
 

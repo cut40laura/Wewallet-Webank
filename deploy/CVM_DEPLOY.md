@@ -1,6 +1,6 @@
 # CVM 部署说明
 
-目标方案：CVM 4C8G、Docker Compose、Nginx、文件数据卷。
+目标方案：CVM 4C8G、Docker Compose、Caddy（自动 HTTPS）、文件数据卷。
 
 ## 1. 服务器准备
 
@@ -70,10 +70,10 @@ runtime/hermes-agent
 
 方案：Caddy 在边缘自动申请 **Let's Encrypt 受信任证书**（绿锁、无警告、自动续期），并把 `/` 反代到 app、`/rtc` 反代到内网实时代理。**不用自签证书、不用单独开 8870 端口、不用手动信任。**
 
-### (1) 确认域名解析到本机 IP
+### (1) 域名与备案
 
-默认配置里写了免费泛解析域名 `115-159-127-218.sslip.io`（自动指向 `115.159.127.218`），但在腾讯云大陆机器上可能被 DNSPod/备案拦截，导致 Let's Encrypt 无法签证书。
-稳定分享给别人，建议使用自己的域名：在 `.env` 设 `WEWALLET_SITE_DOMAIN=你的域名`，把该域名 A 记录解析到服务器 IP，并按云厂商要求完成备案。
+腾讯云大陆服务器上，未备案域名的 80/443 会被拦截，证书签不下来。**必须用已备案、且 A 记录解析到本机 IP 的自有域名。**
+在 `.env` 设 `WEWALLET_SITE_DOMAIN=你的备案域名`。
 
 > Let's Encrypt 签发需要 **80 端口能从公网访问**（你已开放 80/443，无需再开 8870）。
 
@@ -88,8 +88,8 @@ DOUBAO_REALTIME_ACCESS_KEY=...
 # 视觉/风控/矛盾检测（火山方舟）
 ARK_API_KEY=...
 
-# 站点域名（默认 sslip.io，可不改）
-WEWALLET_SITE_DOMAIN=115-159-127-218.sslip.io
+# 已备案、解析到本机 IP 的域名
+WEWALLET_SITE_DOMAIN=你的备案域名
 ```
 
 不配豆包/ARK 凭证，通话代理只会进 mock，不是真通话。
@@ -97,11 +97,10 @@ WEWALLET_SITE_DOMAIN=115-159-127-218.sslip.io
 ### (3) 访问
 
 ```text
-https://你的域名/chat
+https://你的备案域名/chat
 ```
 
 首次启动 Caddy 会自动签证书（约几十秒），之后绿锁、无警告，**网址可直接分享给别人，点开即用**。
-没有可签证书的域名前，`http://115.159.127.218/chat` 仍可用于文字聊天、钱包、画像等非媒体功能；浏览器语音/视频必须等 HTTPS 域名可用。
 
 ## 5. 启动
 
@@ -121,11 +120,10 @@ docker compose logs -f realtime   # 看通话代理是否就绪
 访问：
 
 ```text
-http://115.159.127.218/chat          # 无域名时的非媒体功能保底入口
-https://你的域名/chat                 # 语音/视频等媒体功能需要这个
+https://你的备案域名/chat
 ```
 
-> 首次启动需等 Caddy 签发证书（几十秒）。若免费泛域名被云厂商拦截，换自有域名并完成解析/备案。
+> 80 会自动跳转到 443；首次启动需等 Caddy 签发证书（几十秒）。证书签不下来通常是域名未备案或 80 端口不通。
 
 ## 6. 备份
 
@@ -139,7 +137,7 @@ bash deploy/scripts/backup-data.sh
 
 ## 7. 仍需生产化的点
 
-- 当前后端仍是 Python `ThreadingHTTPServer`，已经可以由 Nginx 反代做小规模试点；后续要支持更高并发，建议重构为 ASGI 服务再接 uvicorn/gunicorn。
+- 当前后端仍是 Python `ThreadingHTTPServer`，已经可以由 Caddy 反代做小规模试点；后续要支持更高并发，建议重构为 ASGI 服务再接 uvicorn/gunicorn。
 - AI 对话和画像更新仍是长请求同步执行；试点可以用，正式上线建议接任务队列。
 - 用户、企业、会话当前是 JSON 文件；正式对外建议迁移到 TencentDB。
 - 上传材料当前落本地数据卷；正式对外建议迁移到 COS。
