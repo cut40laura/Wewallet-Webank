@@ -1,21 +1,12 @@
-const state = {
-  messages: [],
-  attachments: [],
-  busy: false,
-  recorder: null,
-  recordingChunks: [],
-  voiceMeter: null,
-  auth: null,
-  loginMode: "password",
-  accountProfile: null,
-  wallet: null,
-  walletPeriod: "day",
-  walletChartMode: "bar",
-  walletPending: [],
-  walletPendingBusyIds: new Set(),
-  profilePollTimer: null,
-  profileLastUpdatedAt: "",
-};
+/*
+ * chat.js — 桌面端 view 层。
+ *
+ * 只负责 DOM 渲染与交互绑定。业务数据/网络/SSE 在 shared/core.js（全局 Core + state），
+ * 纯函数在 shared/format.js。本文件通过 Core.on(事件) 订阅数据变化后渲染，
+ * 通过 Core.xxx() 触发业务动作。事件契约见 shared/core.js 头部注释。
+ *
+ * 加载顺序：shared/format.js → shared/core.js → chat.js → voicecall.js。
+ */
 
 const SHOW_INTERNAL_PANELS = localStorage.getItem("wewallet.showInternalPanels") === "1";
 const appShell = document.querySelector(".app-shell");
@@ -152,204 +143,10 @@ const accountEnterpriseFields = {
 const DEFAULT_MESSAGE_PLACEHOLDER = "请输入您的经营情况、资金需求或材料问题";
 const MOBILE_MESSAGE_PLACEHOLDER = "输入消息";
 
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
-function escapeAttribute(value) {
-  return escapeHtml(value).replaceAll('"', "&quot;");
-}
-
-function renderInlineMarkdown(value) {
-  let text = escapeHtml(value);
-  const codeSpans = [];
-  text = text.replace(/`([^`]+)`/g, (_match, code) => {
-    const token = `\u0000CODE${codeSpans.length}\u0000`;
-    codeSpans.push(`<code>${code}</code>`);
-    return token;
-  });
-  text = text
-    .replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, "<strong>$1</strong>")
-    .replace(/__([^_\n][\s\S]*?[^_\n])__/g, "<strong>$1</strong>")
-    .replace(/\*([^*\n]+)\*/g, "<em>$1</em>")
-    .replace(/_([^_\n]+)_/g, "<em>$1</em>");
-  return text.replace(/\u0000CODE(\d+)\u0000/g, (_match, index) => codeSpans[Number(index)] || "");
-}
-
-function splitTableRow(line) {
-  return line
-    .trim()
-    .replace(/^\|/, "")
-    .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => cell.trim());
-}
-
-function isTableDivider(line) {
-  return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
-}
-
-function renderMarkdown(markdown) {
-  const lines = String(markdown || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-  const html = [];
-  let paragraph = [];
-  let listType = "";
-  let tableRows = [];
-  let inCode = false;
-  let codeLang = "";
-  let codeLines = [];
-
-  function flushParagraph() {
-    if (!paragraph.length) return;
-    html.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
-    paragraph = [];
-  }
-
-  function flushList() {
-    if (!listType) return;
-    html.push(`</${listType}>`);
-    listType = "";
-  }
-
-  function flushTable() {
-    if (!tableRows.length) return;
-    const [head, ...body] = tableRows;
-    html.push('<div class="markdown-table-wrap"><table><thead><tr>');
-    for (const cell of head) html.push(`<th>${renderInlineMarkdown(cell)}</th>`);
-    html.push("</tr></thead>");
-    if (body.length) {
-      html.push("<tbody>");
-      for (const row of body) {
-        html.push("<tr>");
-        for (const cell of row) html.push(`<td>${renderInlineMarkdown(cell)}</td>`);
-        html.push("</tr>");
-      }
-      html.push("</tbody>");
-    }
-    html.push("</table></div>");
-    tableRows = [];
-  }
-
-  function flushCode() {
-    if (!inCode) return;
-    const langClass = codeLang ? ` class="language-${escapeAttribute(codeLang)}"` : "";
-    html.push(`<pre><code${langClass}>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
-    inCode = false;
-    codeLang = "";
-    codeLines = [];
-  }
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const trimmed = line.trim();
-
-    if (trimmed.startsWith("```")) {
-      if (inCode) {
-        flushCode();
-      } else {
-        flushParagraph();
-        flushList();
-        flushTable();
-        inCode = true;
-        codeLang = trimmed.slice(3).trim().split(/\s+/)[0] || "";
-      }
-      continue;
-    }
-
-    if (inCode) {
-      codeLines.push(line);
-      continue;
-    }
-
-    if (!trimmed) {
-      flushParagraph();
-      flushList();
-      flushTable();
-      continue;
-    }
-
-    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      flushParagraph();
-      flushList();
-      flushTable();
-      const level = heading[1].length;
-      html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
-      continue;
-    }
-
-    if (line.includes("|") && index + 1 < lines.length && isTableDivider(lines[index + 1])) {
-      flushParagraph();
-      flushList();
-      flushTable();
-      tableRows.push(splitTableRow(line));
-      index += 1;
-      continue;
-    }
-
-    if (tableRows.length && line.includes("|")) {
-      tableRows.push(splitTableRow(line));
-      continue;
-    }
-
-    const unordered = trimmed.match(/^[-*+]\s+(.+)$/);
-    if (unordered) {
-      flushParagraph();
-      flushTable();
-      if (listType !== "ul") {
-        flushList();
-        listType = "ul";
-        html.push("<ul>");
-      }
-      html.push(`<li>${renderInlineMarkdown(unordered[1])}</li>`);
-      continue;
-    }
-
-    const ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
-    if (ordered) {
-      flushParagraph();
-      flushTable();
-      if (listType !== "ol") {
-        flushList();
-        listType = "ol";
-        html.push("<ol>");
-      }
-      html.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`);
-      continue;
-    }
-
-    const quote = trimmed.match(/^>\s?(.+)$/);
-    if (quote) {
-      flushParagraph();
-      flushList();
-      flushTable();
-      html.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
-      continue;
-    }
-
-    flushTable();
-    flushList();
-    paragraph.push(trimmed);
-  }
-
-  flushCode();
-  flushParagraph();
-  flushList();
-  flushTable();
-  return html.join("");
-}
-
 function renderMarkdownInto(element, text) {
   const cleanText = sanitizeVisibleText(text);
   element.classList.add("markdown-body");
   element.innerHTML = cleanText ? renderMarkdown(cleanText) : "";
-}
-
-function stripUploadRequestFence(value) {
-  return String(value || "").replace(/```upload_request\s*\n[\s\S]*?\n```\s*/g, "").trim();
 }
 
 function renderUploadRequestCard(message) {
@@ -458,71 +255,6 @@ function triggerUploadFromCard(message, kind) {
   messageInput.focus();
 }
 
-function sanitizeVisibleText(value) {
-  let text = String(value || "").trim();
-  while (text.includes("<think>") && text.includes("</think>")) {
-    const start = text.indexOf("<think>");
-    const end = text.indexOf("</think>", start);
-    text = `${text.slice(0, start)}${text.slice(end + "</think>".length)}`.trim();
-  }
-  const prefixes = ["Chain of thought", "Thought process"];
-  const lines = text.split("\n");
-  const kept = [];
-  let skipping = false;
-  for (const line of lines) {
-    const stripped = line.trim();
-    if (prefixes.some((prefix) => stripped.startsWith(prefix))) {
-      skipping = true;
-      continue;
-    }
-    if (skipping && (!stripped || stripped.startsWith("最终") || stripped.startsWith("回复") || stripped.startsWith("答案"))) {
-      skipping = false;
-      const visible = stripped.replace(/^最终回复[:：]?/, "").replace(/^回复[:：]?/, "").replace(/^答案[:：]?/, "").trim();
-      if (visible) kept.push(visible);
-      continue;
-    }
-    if (!skipping) kept.push(line);
-  }
-  return kept.join("\n").trim();
-}
-
-function visibleAttachmentText(value, attachments) {
-  const text = sanitizeVisibleText(value);
-  const items = Array.isArray(attachments) ? attachments.filter(Boolean) : [];
-  if (!items.length) return text;
-  if (/^\[(图片|视频|文件)附件\]$/.test(text)) return "";
-  if (/^\[语音附件[^\]]*\]$/.test(text)) return "";
-  const voiceOnly = text.match(/^\[语音\]\s*([\s\S]+)$/);
-  if (voiceOnly) return voiceOnly[1].trim();
-  return text;
-}
-
-const REASONING_TAGS = ["think", "reasoning", "thinking", "thought", "REASONING_SCRATCHPAD"];
-
-function splitReasoning(value) {
-  let text = String(value || "");
-  const reasoning = [];
-  for (const tag of REASONING_TAGS) {
-    const paired = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>\\s*`, "gi");
-    text = text.replace(paired, (_match, inner) => {
-      const trimmed = String(inner || "").trim();
-      if (trimmed) reasoning.push(trimmed);
-      return "";
-    });
-
-    const unclosed = new RegExp(`<${tag}>([\\s\\S]*)$`, "i");
-    text = text.replace(unclosed, (_match, inner) => {
-      const trimmed = String(inner || "").trim();
-      if (trimmed) reasoning.push(trimmed);
-      return "";
-    });
-  }
-  return {
-    text: text.trim(),
-    reasoning: reasoning.join("\n\n").trim(),
-  };
-}
-
 function appendDetails(container, className, title, bodyText, open = false) {
   const text = sanitizeVisibleText(bodyText);
   if (!text) return;
@@ -535,109 +267,6 @@ function appendDetails(container, className, title, bodyText, open = false) {
   body.innerHTML = escapeHtml(text).replaceAll("\n", "<br>");
   details.append(summary, body);
   container.appendChild(details);
-}
-
-// 处理过程的线性图标（与界面其余 SVG 风格一致）
-const PROC_ICONS = {
-  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
-  doc: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
-  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
-  chart: '<path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-6"/><path d="M3 20h18"/>',
-  book: '<path d="M5 4h13v16H6a2 2 0 0 1 0-4h12"/>',
-  mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/>',
-  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="m21 16-5-5L5 20"/>',
-  bulb: '<path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10c.7.7 1 1.6 1 2h6c0-.4.3-1.3 1-2a6 6 0 0 0-4-10Z"/>',
-  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
-  check: '<path d="m5 12 5 5L20 6"/>',
-  alert: '<circle cx="12" cy="12" r="9"/><path d="M12 7v6"/><path d="M12 16.5v.01"/>',
-};
-
-function procSvg(key) {
-  const inner = PROC_ICONS[key] || PROC_ICONS.clock;
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
-}
-
-// 步骤类型图标用 emoji（彩色更直观），底色由 tone chip 提供
-const PROC_EMOJI = {
-  bulb: "💡",
-  book: "📚",
-  chart: "📊",
-  edit: "✏️",
-  search: "🔍",
-  image: "🖼️",
-  mic: "🎙️",
-  doc: "📄",
-  reply: "💬",
-  clock: "⚙️",
-};
-
-function procEmoji(key) {
-  return PROC_EMOJI[key] || PROC_EMOJI.clock;
-}
-
-// 把工具调用翻译成面向小微企业主的业务语言 + 图标
-function describeProcStep(item) {
-  const tid = String(item.tool_id || "").toLowerCase();
-  const name = String(item.name || "");
-  const lower = name.toLowerCase();
-  const has = (...kw) => kw.some((k) => tid.includes(k) || lower.includes(k));
-  if (has("asr") || name.includes("语音")) return { icon: "mic", tone: "orange", label: "识别你的语音" };
-  if (has("knowledge") || name.includes("知识库")) return { icon: "book", tone: "indigo", label: "查阅贷款知识库" };
-  if (has("image", "图档", "图片")) return { icon: "image", tone: "rose", label: "翻阅历史图档" };
-  if (has("profile") || name.includes("画像")) return { icon: "edit", tone: "teal", label: "更新你的经营画像" };
-  if (has("wallet") || name.includes("钱包") || name.includes("流水")) return { icon: "chart", tone: "green", label: "分析钱包流水" };
-  if (has("write", "edit", "update") || name.includes("更新") || name.includes("写")) return { icon: "edit", tone: "teal", label: "更新你的资料" };
-  if (has("search", "grep", "rg") || name.includes("检索") || name.includes("搜索")) return { icon: "search", tone: "blue", label: "检索相关信息" };
-  if (has("read", "fetch", "get") || name.includes("查阅") || name.includes("查看") || name.includes("读取")) return { icon: "doc", tone: "blue", label: "查阅资料" };
-  // 兜底：中文工具名直接用，否则给通用文案
-  const friendly = /[一-龥]/.test(name) ? name : "处理中";
-  return { icon: "clock", tone: "gray", label: friendly };
-}
-
-// 每条事件 = 一个时间线节点，保留事件原始文本（细粒度，不做工具合并）
-function buildProcSteps(items) {
-  const steps = [];
-  for (const item of items) {
-    const data = typeof item === "object" ? item : { text: item };
-    const type = String(data.type || "");
-    const isThink = /think|reason/i.test(type);
-    let label = sanitizeVisibleText(data.text || data.preview || data.name || "");
-    if (!label && !isThink) continue;
-
-    // 连续的思考增量合并成同一个“思考”节点，只保留最新的实时状态
-    if (isThink) {
-      const prev = steps[steps.length - 1];
-      if (prev && prev.kind === "think") {
-        if (label) prev.live = label;
-        continue;
-      }
-      steps.push({ kind: "think", icon: "bulb", tone: "amber", live: label, label: "", status: "step", dur: "" });
-      continue;
-    }
-
-    // 工具/其它事件：把结尾的耗时（如 "... 0.8s"）抽出来单独右侧展示
-    let dur = "";
-    const durMatch = label.match(/\s(\d+(?:\.\d+)?)\s*s$/);
-    if (durMatch) {
-      const seconds = parseFloat(durMatch[1]);
-      dur = seconds < 0.1 ? "<0.1s" : `${durMatch[1]}s`;
-      label = label.slice(0, durMatch.index).trim();
-    }
-    // 把后端的英文前缀换成中文友好表达
-    label = label
-      .replace(/^started\s+/i, "开始")
-      .replace(/^complete\s+/i, "完成")
-      .replace(/^preparing\s+/i, "准备")
-      .replace(/^generating\s+/i, "准备")
-      .replace(/^error\s+/i, "失败 · ")
-      .replace(/\.{3}$/, "…");
-    let status = "step";
-    if (data.status === "error" || type === "error") status = "error";
-    else if (type === "tool.complete") status = "done";
-    const desc = describeProcStep(data);
-    steps.push({ icon: desc.icon, tone: desc.tone, label, status, dur });
-  }
-  return steps;
 }
 
 function appendProgress(container, progress, streaming = false) {
@@ -696,11 +325,6 @@ function appendProgress(container, progress, streaming = false) {
   container.appendChild(details);
 }
 
-function isThinkingStatus(text) {
-  const value = String(text || "").trim();
-  return Boolean(value) && value.length <= 80 && !value.includes("\n");
-}
-
 function appendDiffPanels(container, diffs, open = false) {
   const items = Array.isArray(diffs) ? diffs.filter(Boolean) : [];
   if (!items.length) return;
@@ -719,142 +343,6 @@ function appendDiffPanels(container, diffs, open = false) {
   container.appendChild(details);
 }
 
-function fileSizeLabel(size) {
-  const value = Number(size || 0);
-  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
-  if (value >= 1024) return `${Math.ceil(value / 1024)} KB`;
-  return `${value} B`;
-}
-
-function moneyLabel(value) {
-  return `¥${Number(value || 0).toLocaleString("zh-CN", { maximumFractionDigits: 0 })}`;
-}
-
-function parseWalletDate(value) {
-  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (!match) return null;
-  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
-}
-
-function walletPeriodLabel(period) {
-  return period === "week" ? "周" : period === "month" ? "月" : "日";
-}
-
-function walletAnchorDate(transactions) {
-  const dates = transactions.map((item) => parseWalletDate(item.date)).filter(Boolean);
-  if (!dates.length) return new Date();
-  return new Date(Math.max(...dates.map((date) => date.getTime())));
-}
-
-function sameWalletDay(left, right) {
-  return left.getFullYear() === right.getFullYear()
-    && left.getMonth() === right.getMonth()
-    && left.getDate() === right.getDate();
-}
-
-function walletWeekStart(date) {
-  const copy = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  const day = copy.getDay() || 7;
-  copy.setDate(copy.getDate() - day + 1);
-  return copy;
-}
-
-function walletDateKey(date, period) {
-  if (period === "month") {
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-  }
-  if (period === "week") {
-    const start = walletWeekStart(date);
-    return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
-  }
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-}
-
-function walletBucketLabel(date, period) {
-  if (period === "month") return `${date.getMonth() + 1}月`;
-  if (period === "week") {
-    const start = walletWeekStart(date);
-    return `${start.getMonth() + 1}/${start.getDate()}周`;
-  }
-  return `${date.getMonth() + 1}/${date.getDate()}`;
-}
-
-function shiftWalletDate(date, period, offset) {
-  const copy = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  if (period === "month") {
-    copy.setMonth(copy.getMonth() + offset, 1);
-    return copy;
-  }
-  copy.setDate(copy.getDate() + offset * (period === "week" ? 7 : 1));
-  return period === "week" ? walletWeekStart(copy) : copy;
-}
-
-function walletTrendBuckets(transactions, period) {
-  const anchor = period === "week" ? walletWeekStart(walletAnchorDate(transactions)) : walletAnchorDate(transactions);
-  const count = period === "day" ? 7 : 6;
-  const buckets = Array.from({ length: count }, (_item, index) => {
-    const date = shiftWalletDate(anchor, period, index - count + 1);
-    return {
-      key: walletDateKey(date, period),
-      label: walletBucketLabel(date, period),
-      income: 0,
-      expense: 0,
-      net: 0,
-    };
-  });
-  const byKey = new Map(buckets.map((bucket) => [bucket.key, bucket]));
-  for (const item of transactions) {
-    const date = parseWalletDate(item.date);
-    if (!date) continue;
-    const bucket = byKey.get(walletDateKey(date, period));
-    if (!bucket) continue;
-    const amount = Number(item.amount || 0);
-    if (item.type === "income") bucket.income += amount;
-    if (item.type === "expense") bucket.expense += amount;
-  }
-  for (const bucket of buckets) bucket.net = bucket.income - bucket.expense;
-  return buckets;
-}
-
-function walletPeriodStats(transactions, period) {
-  const anchor = walletAnchorDate(transactions);
-  const weekStart = walletWeekStart(anchor);
-  const items = transactions.filter((item) => {
-    const date = parseWalletDate(item.date);
-    if (!date) return false;
-    if (period === "month") {
-      return date.getFullYear() === anchor.getFullYear() && date.getMonth() === anchor.getMonth();
-    }
-    if (period === "week") {
-      const diffDays = Math.floor((date - weekStart) / 86400000);
-      return diffDays >= 0 && diffDays < 7;
-    }
-    return sameWalletDay(date, anchor);
-  });
-  const income = items.reduce((sum, item) => sum + (item.type === "income" ? Number(item.amount || 0) : 0), 0);
-  const expense = items.reduce((sum, item) => sum + (item.type === "expense" ? Number(item.amount || 0) : 0), 0);
-  return {
-    income,
-    expense,
-    net: income - expense,
-    count: items.length,
-    anchor,
-    items,
-  };
-}
-
-function walletCategoriesByType(items, type) {
-  const totals = new Map();
-  for (const item of items) {
-    if (item.type !== type) continue;
-    const key = String(item.category || "未分类").trim() || "未分类";
-    totals.set(key, (totals.get(key) || 0) + Number(item.amount || 0));
-  }
-  return [...totals.entries()]
-    .map(([category, amount]) => ({ category, amount }))
-    .sort((left, right) => right.amount - left.amount);
-}
-
 function renderWalletBarChart(buckets) {
   const maxValue = Math.max(1, ...buckets.flatMap((item) => [item.income || 0, item.expense || 0]));
   return buckets.map((item) => `
@@ -867,16 +355,6 @@ function renderWalletBarChart(buckets) {
       <small>${moneyLabel(item.net)}</small>
     </div>
   `).join("");
-}
-
-function walletLinePoints(values, maxValue, height) {
-  const width = 100;
-  const step = values.length > 1 ? width / (values.length - 1) : width;
-  return values.map((value, index) => {
-    const x = index * step;
-    const y = height - (Number(value || 0) / maxValue) * (height - 8) - 4;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
 }
 
 function renderWalletLineChart(buckets) {
@@ -941,58 +419,6 @@ function renderWalletPieChart(items) {
   `;
 }
 
-function attachmentKind(attachment) {
-  const type = String(attachment.type || attachment.mime || "");
-  if (type.startsWith("image/")) return "image";
-  if (type.startsWith("audio/")) return "audio";
-  if (type.startsWith("video/")) return "video";
-  return "file";
-}
-
-function addAttachment(file) {
-  const kind = attachmentKind(file);
-  const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  state.attachments.push({
-    id,
-    file,
-    kind,
-    name: file.name || (kind === "audio" ? "voice.webm" : kind),
-    size: file.size || 0,
-    type: file.type || "",
-    url: URL.createObjectURL(file),
-  });
-  renderAttachmentPreview();
-}
-
-function attachmentIcon(kind) {
-  if (kind === "image") return "图";
-  if (kind === "video") return "视";
-  if (kind === "audio") return "音";
-  return "文";
-}
-
-function attachmentLabel(kind) {
-  if (kind === "image") return "图片";
-  if (kind === "video") return "视频";
-  if (kind === "audio") return "语音";
-  return "文件";
-}
-
-function clearAttachments() {
-  for (const attachment of state.attachments) {
-    if (attachment.url && attachment.url.startsWith("blob:")) URL.revokeObjectURL(attachment.url);
-  }
-  state.attachments = [];
-  renderAttachmentPreview();
-}
-
-function removeAttachment(id) {
-  const attachment = state.attachments.find((item) => item.id === id);
-  if (attachment?.url?.startsWith("blob:")) URL.revokeObjectURL(attachment.url);
-  state.attachments = state.attachments.filter((item) => item.id !== id);
-  renderAttachmentPreview();
-}
-
 function renderAttachmentPreview() {
   attachmentPreview.innerHTML = "";
   attachmentPreview.hidden = state.attachments.length === 0;
@@ -1040,7 +466,7 @@ function renderAttachmentPreview() {
     remove.type = "button";
     remove.setAttribute("aria-label", "删除附件");
     remove.textContent = "×";
-    remove.onclick = () => removeAttachment(attachment.id);
+    remove.onclick = () => Core.removeAttachment(attachment.id);
     chip.appendChild(remove);
     attachmentPreview.appendChild(chip);
   }
@@ -1127,9 +553,9 @@ function renderEmpty() {
   messageList.innerHTML = `
     <div class="empty-state">
       <div class="empty-mascot" aria-hidden="true">
-        <video class="mascot-video" autoplay muted loop playsinline preload="metadata" poster="/static/assets/mascot-smile.png">
-          <source src="/static/assets/character-loop.webm" type="video/webm" />
-          <img src="/static/assets/mascot-smile.png" alt="" />
+        <video class="mascot-video" autoplay muted loop playsinline preload="metadata" poster="/static/shared/assets/mascot-smile.png">
+          <source src="/static/shared/assets/character-loop.webm" type="video/webm" />
+          <img src="/static/shared/assets/mascot-smile.png" alt="" />
         </video>
       </div>
       <h1>聊聊您的生意和资金需求</h1>
@@ -1181,7 +607,7 @@ function renderMessages() {
       bubble.innerHTML = escapeHtml(sanitizeVisibleText(visibleContent)).replaceAll("\n", "<br>");
     }
     if (message.role === "assistant") {
-      node.querySelector(".avatar").style.backgroundImage = 'url("/static/assets/xiaowei-avatar-pro.png")';
+      node.querySelector(".avatar").style.backgroundImage = 'url("/static/shared/assets/xiaowei-avatar-pro.png")';
       node.querySelector(".avatar").classList.add("has-image");
       const uploadCard = renderUploadRequestCard(message);
       if (uploadCard) bubble.appendChild(uploadCard);
@@ -1204,34 +630,21 @@ function renderMessages() {
   messageList.scrollTop = messageList.scrollHeight;
 }
 
-function setBusy(value) {
-  state.busy = value;
+function applyBusy() {
+  const value = state.busy;
   sendButton.disabled = value;
   imageButton.disabled = value;
   micButton.disabled = value;
   messageInput.disabled = value;
 }
 
-async function postJson(path, body = {}) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "请求失败");
-  }
-  return payload;
-}
-
-async function getJson(path) {
-  const response = await fetch(path);
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "请求失败");
-  }
-  return payload;
+// 守卫通过（真的发出去了）才清空输入框；Core.sendMessage 在守卫不过时返回 null。
+function sendMessage(content) {
+  const pending = Core.sendMessage(content);
+  if (!pending) return;
+  messageInput.value = "";
+  messageInput.style.height = "";
+  syncComposerTextState();
 }
 
 function setSidebarCollapsed(collapsed) {
@@ -1263,11 +676,6 @@ function syncComposerTextState() {
 function showComingSoon(feature) {
   attachmentPopover.hidden = true;
   alert(`${feature}开发中，敬请期待`);
-}
-
-function initials(value) {
-  const text = String(value || "").trim();
-  return text ? text.slice(0, 1) : "企";
 }
 
 function setAvatarElement(element, url, fallback) {
@@ -1308,22 +716,22 @@ function showRegister(show) {
   showAuthMessage("");
 }
 
-function applyAuthState(auth) {
-  state.auth = auth || { authenticated: false };
-  const authenticated = Boolean(state.auth.authenticated) && !state.auth.needs_enterprise;
+function renderAuthState() {
+  const auth = state.auth || { authenticated: false };
+  const authenticated = Boolean(auth.authenticated) && !auth.needs_enterprise;
   authScreen.hidden = authenticated;
-  if (!state.auth.authenticated) {
+  if (!auth.authenticated) {
     loginForm.hidden = false;
     registerForm.hidden = true;
     enterpriseForm.hidden = true;
   } else {
     loginForm.hidden = true;
     registerForm.hidden = true;
-    enterpriseForm.hidden = !state.auth.needs_enterprise;
+    enterpriseForm.hidden = !auth.needs_enterprise;
   }
-  const label = state.accountProfile?.nickname || state.auth.enterprise?.name || state.auth.user?.phone || "未登录";
+  const label = state.accountProfile?.nickname || auth.enterprise?.name || auth.user?.phone || "未登录";
   accountLabel.textContent = label;
-  sessionStatus.textContent = state.auth.enterprise ? "企业专属档案" : "等待绑定企业";
+  sessionStatus.textContent = auth.enterprise ? "企业专属档案" : "等待绑定企业";
   setAvatarElement(accountAvatar, state.accountProfile?.avatar_url || "", label);
   composerForm.hidden = !authenticated;
   openProfileButton.disabled = !authenticated;
@@ -1331,22 +739,22 @@ function applyAuthState(auth) {
   openLoanButton.disabled = !authenticated;
 }
 
-function renderWallet(payload) {
-  state.wallet = payload || state.wallet || { transactions: [], summary: {} };
+function renderWallet() {
+  const wallet = state.wallet || { transactions: [], summary: {} };
   walletPeriodTabs.forEach((button) => {
     button.classList.toggle("is-active", button.dataset.walletPeriod === state.walletPeriod);
   });
   walletChartModeButtons.forEach((button) => {
     button.classList.toggle("is-active", button.dataset.walletChart === state.walletChartMode);
   });
-  const transactionsForPeriod = state.wallet.transactions || [];
+  const transactionsForPeriod = wallet.transactions || [];
   const periodStats = walletPeriodStats(transactionsForPeriod, state.walletPeriod);
   const periodName = walletPeriodLabel(state.walletPeriod);
   const anchorText = periodStats.anchor.toLocaleDateString("zh-CN", {
     month: "2-digit",
     day: "2-digit",
   });
-  const summary = state.wallet.summary || {};
+  const summary = wallet.summary || {};
   const plan = summary.plan || {};
   walletSummary.innerHTML = `
     <div class="wallet-card"><span>${periodName}收入 · ${anchorText}</span><strong>${moneyLabel(periodStats.income)}</strong></div>
@@ -1374,7 +782,7 @@ function renderWallet(payload) {
     <div class="wallet-plan-row"><span>增长预算</span><strong>${moneyLabel(plan.suggested_reinvestment)}</strong></div>
   `;
 
-  const transactions = [...(state.wallet.transactions || [])].slice(-8).reverse();
+  const transactions = [...(wallet.transactions || [])].slice(-8).reverse();
   walletTransactions.innerHTML = transactions.length ? transactions.map((item) => `
     <div class="wallet-row">
       <div>
@@ -1389,11 +797,6 @@ function renderWallet(payload) {
     : "规划建议会在录入更多流水后生成。";
 }
 
-async function loadWallet() {
-  if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
-  renderWallet(await getJson("/api/wallet"));
-}
-
 async function openWallet() {
   if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
   walletBackdrop.hidden = false;
@@ -1402,7 +805,7 @@ async function openWallet() {
   walletEntryForm.hidden = true;
   walletDate.value = new Date().toISOString().slice(0, 10);
   try {
-    await loadWallet();
+    await Core.loadWallet();
   } catch (error) {
     walletMessage.textContent = `读取失败：${error.message}`;
   }
@@ -1414,30 +817,12 @@ function closeWallet() {
   walletDrawer.setAttribute("aria-hidden", "true");
 }
 
-function formatLoanAmount(value) {
-  const num = Number(value) || 0;
-  return Number.isInteger(num) ? String(num) : num.toFixed(1);
-}
-
-function formatLoanRate(value) {
-  const num = Number(value) || 0;
-  return Number.isInteger(num) ? String(num) : num.toFixed(2).replace(/0$/, "");
-}
-
 function renderLoanLoading() {
   loanBody.innerHTML = `
     <div class="loan-loading">
       <span class="loan-spinner" aria-hidden="true"></span>
       <span>正在根据您的风控画像和经营流水预估额度...</span>
     </div>`;
-}
-
-function formatLoanTimestamp(value) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function setLoanUpdatedAt(estimate) {
@@ -1662,15 +1047,6 @@ function collectAccountProfilePayload() {
   };
 }
 
-async function loadAccountProfile() {
-  if (!state.auth?.authenticated || state.auth?.needs_enterprise) return null;
-  const payload = await getJson("/api/account/profile");
-  state.accountProfile = payload.profile || null;
-  if (state.accountProfile) fillAccountForm(state.accountProfile);
-  applyAuthState(state.auth);
-  return state.accountProfile;
-}
-
 async function openAccountModal() {
   if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
   accountBackdrop.hidden = false;
@@ -1679,7 +1055,7 @@ async function openAccountModal() {
   showAccountMessage("");
   setAccountTab("user");
   try {
-    await loadAccountProfile();
+    await Core.loadAccountProfile();
   } catch (error) {
     showAccountMessage(`读取失败：${error.message}`, true);
   }
@@ -1691,41 +1067,15 @@ function closeAccountModal() {
   accountModal.setAttribute("aria-hidden", "true");
 }
 
-async function loadMessages() {
-  const payload = await getJson("/api/messages");
-  state.messages = payload.messages || [];
-  renderMessages();
-  void ensureLatestSuggestions();
-}
-
-async function ensureLatestSuggestions() {
-  if (state.busy || !state.messages.length) return;
-  const latestAssistant = [...state.messages].reverse().find((message) => (
-    message.role === "assistant" &&
-    String(message.content || "").trim() &&
-    !Array.isArray(message.suggestions)
-  ));
-  if (!latestAssistant) return;
-  try {
-    const payload = await postJson("/api/messages/suggestions");
-    if (Array.isArray(payload.messages)) {
-      state.messages = payload.messages;
-      renderMessages();
-    }
-  } catch (error) {
-    // Recommendation chips are helpful, but chat history should still render normally.
-  }
-}
-
 async function bootstrapApp() {
   try {
     const auth = await getJson("/api/auth/me");
-    applyAuthState(auth);
+    Core.setAuth(auth);
     if (auth.authenticated && !auth.needs_enterprise) {
-      await loadAccountProfile();
-      await loadMessages();
-      await loadProfile();
-      await loadWalletPending();
+      await Core.loadAccountProfile();
+      await Core.loadMessages();
+      await Core.loadProfile();
+      await Core.loadWalletPending();
       if (window.location.hash === "#wallet") {
         await openWallet();
       }
@@ -1733,275 +1083,10 @@ async function bootstrapApp() {
       renderMessages();
     }
   } catch (error) {
-    applyAuthState({ authenticated: false });
+    Core.setAuth({ authenticated: false });
     showAuthMessage(error.message, true);
     renderMessages();
   }
-}
-
-function lastAssistantMessage() {
-  return state.messages[state.messages.length - 1];
-}
-
-function appendUniqueProgress(message, text) {
-  if (!message) return;
-  const value = typeof text === "object" ? text : sanitizeVisibleText(text);
-  if (!value) return;
-  message.progress = Array.isArray(message.progress) ? message.progress : [];
-  const previous = message.progress[message.progress.length - 1];
-  const previousText = typeof previous === "object" ? previous.text : previous;
-  const nextText = typeof value === "object" ? value.text : value;
-  if (previousText !== nextText) {
-    message.progress.push(value);
-  }
-}
-
-function applyChatStreamEvent(event) {
-  const message = lastAssistantMessage();
-  if (!message || message.role !== "assistant") return;
-  const payload = event.payload || {};
-  if (event.type === "assistant.start") {
-    message.content = payload.content || message.content || "正在分析客户需求...";
-  } else if (event.type === "progress.delta") {
-    appendUniqueProgress(message, payload.text || "");
-  } else if (event.type === "tool.generating") {
-    appendUniqueProgress(message, { type: event.type, name: payload.name || "", text: `preparing ${payload.name || "tool"}...` });
-  } else if (event.type === "tool.progress") {
-    appendUniqueProgress(message, { type: event.type, name: payload.name || "", text: payload.preview || payload.text || payload.name || "" });
-  } else if (event.type === "tool.start") {
-    appendUniqueProgress(message, { type: event.type, name: payload.name || "", text: `started ${payload.name || "tool"}` });
-  } else if (event.type === "tool.complete") {
-    const duration = typeof payload.duration_s === "number" ? ` ${payload.duration_s.toFixed(1)}s` : "";
-    const status = payload.error ? "error" : "complete";
-    const text = payload.error
-      ? `${status} ${payload.name || "tool"}${duration}: ${payload.error}`
-      : `${status} ${payload.name || "tool"}${duration}`;
-    appendUniqueProgress(message, { type: event.type, name: payload.name || "", status, text });
-    if (payload.inline_diff) {
-      message.inline_diffs = Array.isArray(message.inline_diffs) ? message.inline_diffs : [];
-      message.inline_diffs.push(payload.inline_diff);
-    }
-  } else if (event.type === "status.update") {
-    appendUniqueProgress(message, { type: event.type, status: payload.kind || "", text: payload.text || "" });
-  } else if (event.type === "thinking.delta" || event.type === "reasoning.delta") {
-    const text = String(payload.text || "");
-    if (text) {
-      message.thinking = `${message.thinking || ""}${text}`;
-      // Only thinking.delta carries short status pings (e.g. "(⊙_⊙) deliberating...").
-      // reasoning.delta streams the model's chain-of-thought token-by-token; those
-      // tokens are short and newline-free, so they must NOT be shown as progress —
-      // otherwise the whole reasoning leaks into the live progress ticker.
-      if (event.type === "thinking.delta" && isThinkingStatus(text)) {
-        appendUniqueProgress(message, { type: event.type, name: "Hermes", text });
-      }
-    }
-  } else if (event.type === "reasoning.available") {
-    return;
-  } else if (event.type === "message.delta") {
-    const text = String(payload.text || "");
-    if (text) {
-      if (message.content === "正在分析客户需求...") message.content = "";
-      message.content = `${message.content || ""}${text}`;
-    }
-  } else if (event.type === "message.complete") {
-    state.messages = payload.messages || state.messages;
-    if (Array.isArray(payload.wallet_pending)) {
-      state.walletPending = payload.wallet_pending;
-      renderWalletPending();
-    }
-    if (payload.auto_profile?.scheduled && profileSummary) {
-      profileSummary.textContent = `已自动开始更新风控画像（第 ${payload.auto_profile.user_turn_count} 轮），稍后会自动刷新...`;
-      startProfilePolling();
-    } else if (payload.auto_profile?.in_progress && profileSummary) {
-      startProfilePolling();
-    }
-  } else if (event.type === "error") {
-    throw new Error(payload.error || payload.message || "调用失败");
-  }
-}
-
-async function postStreamingChat(message, attachments = []) {
-  const body = new FormData();
-  body.append("message", message);
-  for (const attachment of attachments) {
-    if (attachment.file) body.append("attachments", attachment.file, attachment.name || attachment.file.name);
-  }
-  const response = await fetch("/api/chat/stream", {
-    method: "POST",
-    body,
-  });
-  if (!response.ok || !response.body) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || "请求失败");
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let completed = false;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const event = JSON.parse(line);
-      applyChatStreamEvent(event);
-      if (event.type === "message.complete") completed = true;
-      renderMessages();
-    }
-  }
-
-  const tail = buffer.trim();
-  if (tail) {
-    const event = JSON.parse(tail);
-    applyChatStreamEvent(event);
-    if (event.type === "message.complete") completed = true;
-    renderMessages();
-  }
-
-  const assistant = lastAssistantMessage();
-  if (assistant && assistant.role === "assistant") {
-    assistant.streaming = false;
-  }
-  if (!completed) {
-    appendUniqueProgress(assistant, "本轮连接已结束，未收到完成事件。");
-  }
-}
-
-async function sendMessage(content) {
-  const text = content.trim();
-  const attachments = [...state.attachments];
-  if ((!text && !attachments.length) || state.busy) return;
-  const optimisticText = text;
-  const optimisticAttachments = attachments.map((item) => ({
-    kind: item.kind,
-    name: item.name,
-    size: item.size,
-    type: item.type,
-    url: item.url,
-  }));
-  state.messages.push({ role: "user", content: optimisticText, attachments: optimisticAttachments });
-  state.messages.push({ role: "assistant", content: "正在分析客户需求...", thinking: "", progress: [], inline_diffs: [], streaming: true });
-  renderMessages();
-  messageInput.value = "";
-  messageInput.style.height = "";
-  syncComposerTextState();
-  state.attachments = [];
-  renderAttachmentPreview();
-  setBusy(true);
-  try {
-    await postStreamingChat(text, attachments);
-    renderMessages();
-  } catch (error) {
-    state.messages[state.messages.length - 1] = {
-      role: "assistant",
-      content: `调用失败：${error.message}`,
-    };
-    renderMessages();
-  } finally {
-    for (const attachment of attachments) {
-      if (attachment.url && attachment.url.startsWith("blob:")) URL.revokeObjectURL(attachment.url);
-    }
-    setBusy(false);
-  }
-}
-
-async function loadProfile() {
-  if (!state.auth?.authenticated || state.auth?.needs_enterprise) return null;
-  try {
-    const response = await fetch("/api/profile");
-    const payload = await response.json();
-    renderMarkdownInto(profileMarkdown, payload.markdown || "暂无画像。");
-    const profileState = payload.state || {};
-    state.profileLastUpdatedAt = profileState.last_profile_updated_at || state.profileLastUpdatedAt || "";
-    if (profileState.in_progress) {
-      profileSummary.textContent = "企业画像正在后台更新，稍后会自动刷新...";
-      startProfilePolling();
-    } else if (profileState.last_error) {
-      profileSummary.textContent = `上次更新失败：${profileState.last_error}`;
-    } else {
-      profileSummary.textContent = "查看当前企业的 MD 档案，画像会随对话自动更新。";
-    }
-    renderProfileDiff("", false, true);
-    return payload;
-  } catch (error) {
-    profileSummary.textContent = `读取失败：${error.message}`;
-    return null;
-  }
-}
-
-function startProfilePolling() {
-  if (state.profilePollTimer) return;
-  const baselineUpdatedAt = state.profileLastUpdatedAt || "";
-  const startedAt = Date.now();
-  const tick = async () => {
-    try {
-      const response = await fetch("/api/profile");
-      const payload = await response.json();
-      const profileState = payload.state || {};
-      const updatedAt = profileState.last_profile_updated_at || "";
-      const finished = !profileState.in_progress && updatedAt && updatedAt !== baselineUpdatedAt;
-      if (finished) {
-        renderMarkdownInto(profileMarkdown, payload.markdown || "暂无画像。");
-        state.profileLastUpdatedAt = updatedAt;
-        profileSummary.textContent = profileState.last_profile_changed
-          ? "企业画像已更新。"
-          : "企业画像本轮无新增变更。";
-        stopProfilePolling();
-        return;
-      }
-      if (profileState.last_error && !profileState.in_progress) {
-        profileSummary.textContent = `更新失败：${profileState.last_error}`;
-        stopProfilePolling();
-        return;
-      }
-      if (Date.now() - startedAt > 5 * 60 * 1000) {
-        profileSummary.textContent = "画像更新仍在进行，请稍后手动刷新。";
-        stopProfilePolling();
-      }
-    } catch (error) {
-      profileSummary.textContent = `轮询失败：${error.message}`;
-      stopProfilePolling();
-    }
-  };
-  state.profilePollTimer = window.setInterval(tick, 3000);
-  tick();
-}
-
-function formatMoney(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return String(value ?? "");
-  return number.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function describePendingPayload(item) {
-  const action = item.action;
-  if (action === "add") {
-    const p = item.payload || {};
-    const typeLabel = p.type === "income" ? "收入" : "支出";
-    return `新增${typeLabel} ¥${formatMoney(p.amount)}（${p.date || "日期未填"} · ${p.description || "无摘要"} · ${p.category || "未分类"}）`;
-  }
-  if (action === "update") {
-    const before = item.before || {};
-    const changes = item.payload || {};
-    const parts = Object.entries(changes).map(([key, value]) => {
-      const label = ({ type: "类型", amount: "金额", date: "日期", description: "摘要", category: "分类" })[key] || key;
-      const fromValue = key === "amount" ? `¥${formatMoney(before[key])}` : (before[key] ?? "");
-      const toValue = key === "amount" ? `¥${formatMoney(value)}` : value;
-      return `${label} ${fromValue} → ${toValue}`;
-    });
-    return `修改 ${before.date || ""} ${before.description || item.target_id}：${parts.join("、")}`;
-  }
-  if (action === "delete") {
-    const b = item.before || {};
-    const typeLabel = b.type === "income" ? "收入" : "支出";
-    return `删除一笔${typeLabel}：${b.date || ""} ${b.description || ""} ¥${formatMoney(b.amount)}（${b.category || ""}）`;
-  }
-  return `${action} ${item.target_id || ""}`;
 }
 
 function renderWalletPending() {
@@ -2039,96 +1124,18 @@ function renderWalletPending() {
     confirmBtn.className = "confirm";
     confirmBtn.textContent = "确认";
     confirmBtn.disabled = state.walletPendingBusyIds.has(item.id);
-    confirmBtn.onclick = () => resolveWalletPending(item.id, "confirm");
+    confirmBtn.onclick = () => Core.resolveWalletPending(item.id, "confirm");
     const rejectBtn = document.createElement("button");
     rejectBtn.type = "button";
     rejectBtn.className = "reject";
     rejectBtn.textContent = "拒绝";
     rejectBtn.disabled = state.walletPendingBusyIds.has(item.id);
-    rejectBtn.onclick = () => resolveWalletPending(item.id, "reject");
+    rejectBtn.onclick = () => Core.resolveWalletPending(item.id, "reject");
     controls.appendChild(confirmBtn);
     controls.appendChild(rejectBtn);
     wrap.appendChild(left);
     wrap.appendChild(controls);
     walletPendingList.appendChild(wrap);
-  }
-}
-
-async function resolveWalletPending(pendingId, action) {
-  if (!pendingId || state.walletPendingBusyIds.has(pendingId)) return;
-  state.walletPendingBusyIds.add(pendingId);
-  renderWalletPending();
-  try {
-    const response = await fetch(`/api/wallet/pending/${encodeURIComponent(pendingId)}/${action}`, {
-      method: "POST",
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      alert(payload.error || `${action === "confirm" ? "确认" : "拒绝"}失败`);
-      state.walletPending = state.walletPending.filter((item) => item.id !== pendingId);
-    } else {
-      state.walletPending = payload.pending || [];
-      if (payload.transactions) {
-        state.wallet = { transactions: payload.transactions, summary: payload.summary };
-        if (walletDrawer && !walletDrawer.hidden) renderWallet();
-      }
-    }
-  } catch (error) {
-    alert(`网络错误：${error.message}`);
-  } finally {
-    state.walletPendingBusyIds.delete(pendingId);
-    renderWalletPending();
-  }
-}
-
-async function loadWalletPending() {
-  if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
-  try {
-    const response = await fetch("/api/wallet/pending");
-    if (!response.ok) return;
-    const payload = await response.json();
-    state.walletPending = payload.pending || [];
-    renderWalletPending();
-  } catch (_) {
-    // silent — refreshed on next chat / page load
-  }
-}
-
-function stopProfilePolling() {
-  if (state.profilePollTimer) {
-    window.clearInterval(state.profilePollTimer);
-    state.profilePollTimer = null;
-  }
-}
-
-async function refreshProfile() {
-  if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
-  if (!refreshProfileButton) return;
-  const originalLabel = refreshProfileButton.textContent;
-  refreshProfileButton.disabled = true;
-  refreshProfileButton.textContent = "刷新中...";
-  if (profileSummary) profileSummary.textContent = "正在检查画像状态...";
-  try {
-    const response = await fetch("/api/profile/refresh", { method: "POST" });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "刷新失败");
-    }
-    const message = payload.message || "";
-    if (profileSummary) profileSummary.textContent = message;
-    const profileState = payload.state || {};
-    state.profileLastUpdatedAt = profileState.last_profile_updated_at || state.profileLastUpdatedAt || "";
-    if (payload.status === "in_progress") {
-      startProfilePolling();
-    } else {
-      await loadProfile();
-      if (profileSummary && message) profileSummary.textContent = message;
-    }
-  } catch (error) {
-    if (profileSummary) profileSummary.textContent = `刷新失败：${error.message}`;
-  } finally {
-    refreshProfileButton.disabled = false;
-    refreshProfileButton.textContent = originalLabel || "刷新";
   }
 }
 
@@ -2143,7 +1150,7 @@ function openProfile(load = true) {
   profileBackdrop.hidden = false;
   profileDrawer.classList.add("open");
   profileDrawer.setAttribute("aria-hidden", "false");
-  if (load) loadProfile();
+  if (load) Core.loadProfile();
 }
 
 function closeProfile() {
@@ -2183,21 +1190,21 @@ pickVideoButton.addEventListener("click", () => {
 
 imageInput.addEventListener("change", () => {
   for (const file of Array.from(imageInput.files || [])) {
-    addAttachment(file);
+    Core.addAttachment(file);
   }
   imageInput.value = "";
 });
 
 fileInput.addEventListener("change", () => {
   for (const file of Array.from(fileInput.files || [])) {
-    addAttachment(file);
+    Core.addAttachment(file);
   }
   fileInput.value = "";
 });
 
 videoInput.addEventListener("change", () => {
   for (const file of Array.from(videoInput.files || [])) {
-    addAttachment(file);
+    Core.addAttachment(file);
   }
   videoInput.value = "";
 });
@@ -2239,11 +1246,11 @@ async function startVoiceInput() {
     if (state.recordingChunks.length) {
       const blob = new Blob(state.recordingChunks, { type: recorder.mimeType || "audio/webm" });
       if (blob.size > 0 && voicePeak >= 0.0015) {
-        addAttachment(new File([blob], `voice-${Date.now()}.webm`, { type: blob.type || "audio/webm" }));
+        Core.addAttachment(new File([blob], `voice-${Date.now()}.webm`, { type: blob.type || "audio/webm" }));
       } else if (blob.size > 0) {
         const sendAnyway = confirm("录音音量很低，可能听不清。要仍然发送这段录音吗？\n\n如果你确定刚才说话了，请先检查浏览器麦克风权限和系统输入设备。");
         if (sendAnyway) {
-          addAttachment(new File([blob], `voice-${Date.now()}.webm`, { type: blob.type || "audio/webm" }));
+          Core.addAttachment(new File([blob], `voice-${Date.now()}.webm`, { type: blob.type || "audio/webm" }));
         }
       } else {
         alert("没有录到声音，请确认麦克风已对准并重试。");
@@ -2372,15 +1379,15 @@ loginForm.addEventListener("submit", async (event) => {
           phone: loginPhone.value.trim(),
           password: loginPassword.value,
         });
-    applyAuthState(auth);
+    Core.setAuth(auth);
     if (auth.needs_enterprise) {
       showAuthMessage("首次登录，请创建企业档案。");
       enterpriseName.focus();
     } else {
       showAuthMessage("");
-      await loadAccountProfile();
-      await loadMessages();
-      await loadProfile();
+      await Core.loadAccountProfile();
+      await Core.loadMessages();
+      await Core.loadProfile();
     }
   } catch (error) {
     showAuthMessage(error.message, true);
@@ -2396,7 +1403,7 @@ registerForm.addEventListener("submit", async (event) => {
       password: registerPassword.value,
       code: registerCode.value.trim(),
     });
-    applyAuthState(auth);
+    Core.setAuth(auth);
     if (auth.needs_enterprise) {
       showAuthMessage("注册成功，请创建企业档案。");
       enterpriseName.focus();
@@ -2419,10 +1426,10 @@ enterpriseForm.addEventListener("submit", async (event) => {
       name: enterpriseName.value.trim(),
       credit_code: enterpriseCreditCode.value.trim(),
     });
-    applyAuthState(payload.auth);
-    await loadAccountProfile();
-    await loadMessages();
-    await loadProfile();
+    Core.setAuth(payload.auth);
+    await Core.loadAccountProfile();
+    await Core.loadMessages();
+    await Core.loadProfile();
     showAuthMessage("");
   } catch (error) {
     showAuthMessage(error.message, true);
@@ -2432,7 +1439,17 @@ enterpriseForm.addEventListener("submit", async (event) => {
 openProfileButton.onclick = openProfile;
 closeProfileButton.onclick = closeProfile;
 profileBackdrop.onclick = closeProfile;
-refreshProfileButton.onclick = refreshProfile;
+refreshProfileButton.onclick = async () => {
+  const originalLabel = refreshProfileButton.textContent;
+  refreshProfileButton.disabled = true;
+  refreshProfileButton.textContent = "刷新中...";
+  try {
+    await Core.refreshProfile();
+  } finally {
+    refreshProfileButton.disabled = false;
+    refreshProfileButton.textContent = originalLabel || "刷新";
+  }
+};
 openWalletButton.onclick = openWallet;
 closeWalletButton.onclick = closeWallet;
 walletBackdrop.onclick = closeWallet;
@@ -2474,7 +1491,7 @@ walletCsvInput.addEventListener("change", async () => {
     const response = await fetch("/api/wallet/import", { method: "POST", body });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "导入失败");
-    renderWallet(payload);
+    Core.setWallet(payload);
   } catch (error) {
     walletMessage.textContent = error.message;
   }
@@ -2493,7 +1510,7 @@ walletEntryForm.addEventListener("submit", async (event) => {
     walletAmount.value = "";
     walletCategory.value = "";
     walletDescription.value = "";
-    renderWallet(payload);
+    Core.setWallet(payload);
   } catch (error) {
     walletMessage.textContent = error.message;
   }
@@ -2546,9 +1563,8 @@ avatarInput.addEventListener("change", async () => {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "上传失败");
     state.accountProfile = payload.profile || state.accountProfile;
-    if (payload.auth) state.auth = payload.auth;
     fillAccountForm(state.accountProfile);
-    applyAuthState(state.auth);
+    Core.setAuth(payload.auth || state.auth);
     showAccountMessage("头像已更新");
   } catch (error) {
     showAccountMessage(error.message, true);
@@ -2561,9 +1577,8 @@ accountProfileForm.addEventListener("submit", async (event) => {
   try {
     const payload = await postJson("/api/account/profile", collectAccountProfilePayload());
     state.accountProfile = payload.profile || state.accountProfile;
-    if (payload.auth) state.auth = payload.auth;
     fillAccountForm(state.accountProfile);
-    applyAuthState(state.auth);
+    Core.setAuth(payload.auth || state.auth);
     showAccountMessage("资料已保存");
   } catch (error) {
     showAccountMessage(error.message, true);
@@ -2572,14 +1587,33 @@ accountProfileForm.addEventListener("submit", async (event) => {
 
 logoutButton.onclick = async () => {
   await postJson("/api/auth/logout");
-  state.auth = { authenticated: false };
   state.accountProfile = null;
   closeAccountModal();
-  applyAuthState(state.auth);
+  Core.setAuth({ authenticated: false });
 };
 
+// ---------- Core 事件订阅：数据变化 → 渲染 ----------
+
+Core.on("messages", renderMessages);
+Core.on("busy", applyBusy);
+Core.on("attachments", renderAttachmentPreview);
+Core.on("auth", renderAuthState);
+Core.on("account-profile", () => {
+  if (state.accountProfile) fillAccountForm(state.accountProfile);
+});
+Core.on("wallet", renderWallet);
+Core.on("wallet-pending", renderWalletPending);
+Core.on("profile-markdown", (text) => renderMarkdownInto(profileMarkdown, text));
+Core.on("profile-status", (text) => {
+  if (profileSummary) profileSummary.textContent = text;
+});
+Core.on("profile-diff", ({ diff, changed, hidden }) => renderProfileDiff(diff, changed, hidden));
+Core.on("notify", (text) => alert(text));
+
+// ---------- 启动 ----------
+
 document.querySelectorAll(".brand-mark").forEach((mark) => {
-  mark.style.backgroundImage = 'url("/static/assets/customer-manager-plus.png")';
+  mark.style.backgroundImage = 'url("/static/shared/assets/customer-manager-plus.png")';
   mark.classList.add("has-image");
 });
 setSidebarCollapsed(localStorage.getItem("wewallet.sidebarCollapsed") === "1");
@@ -2591,5 +1625,5 @@ bootstrapApp();
 // 视频通话挂断、对话已并入会话时，自动重新拉取消息渲染（无需手动刷新浏览器）。
 // voicecall.js 在 /api/voicecall/end 落库成功后派发此事件。
 document.addEventListener("voicecall:saved", () => {
-  loadMessages().catch(() => {});
+  Core.loadMessages().catch(() => {});
 });

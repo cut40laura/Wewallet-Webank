@@ -1,0 +1,25 @@
+/*
+ * shared/tokens.css — 品牌设计变量（桌面端 / 手机端共用）。
+ *
+ * 只放设计 token（颜色、阴影等），不放任何选择器样式。
+ * 两端各自的 chat.css 都依赖这里的变量，改动会同时影响两端，改前先打招呼。
+ * 各端如需差异化取值，在自己的 chat.css 里重新声明同名变量覆盖即可。
+ */
+
+:root {
+  --bg: #f6f9fb;
+  --surface: #ffffff;
+  --sidebar: #f1f5f7;
+  --sidebar-hover: #e6edf1;
+  --sidebar-active: #ddeff0;
+  --sidebar-text: #18313d;
+  --sidebar-muted: #718692;
+  --border: rgba(22, 61, 76, 0.11);
+  --ink: #1f3138;
+  --muted: #697b84;
+  --brand: #00a6b4;
+  --brand-strong: #007a9b;
+  --brand-blue: #2f80ed;
+  --danger: #a43a3a;
+  --shadow: 0 18px 50px rgba(26, 68, 86, 0.11);
+}

@@ -44,6 +44,7 @@
     engine: null, // 当前引擎实例（realtime 或 placeholder）
     stream: null, // 仅当 chat.js 没开摄像头时我们自己开的流
     transcript: [], // 本通对话逐句累积（{role:"user"|"ai", text}）；挂断时回流并入主聊天记忆
+    startedAt: 0, // 接通时刻（Date.now()），挂断回流时算通话时长，随尽调留痕落库
   };
 
   // 累一句到通话记录（挂断时 POST /api/voicecall/end 并入主聊天时间线+更新画像）。
@@ -58,11 +59,16 @@
     const turns = call.transcript;
     call.transcript = [];
     if (!turns.length) return;
+    // 通话元数据随尽调留痕一起落库（video_calls 表）：何时接通、聊了多久。
+    const metadata = call.startedAt
+      ? { started_at: new Date(call.startedAt).toISOString(), duration_sec: Math.round((Date.now() - call.startedAt) / 1000) }
+      : {};
+    call.startedAt = 0;
     try {
       fetch("/api/voicecall/end", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: turns }),
+        body: JSON.stringify({ transcript: turns, metadata }),
         keepalive: true,
       })
         .then((r) => r.json())
@@ -77,6 +83,76 @@
 
   function setStatus(text) {
     if (statusEl) statusEl.textContent = text;
+  }
+
+  // ── 实时风控警示（画面疑点 / 口述与档案不符）──────────────────────────────
+  // relay 旁路检测命中时记入折叠面板：摘要条一行（⚠ 风险提示 · N 处 最新：…），
+  // 点开是可滚动明细列表。默认折叠，不遮画面。仅给经办人看（小微的核对提示走
+  // 静默注入，不读出来）。纯渲染：数据都来自服务端事件，前端零检测逻辑、零请求。
+  const riskAlertsEl = document.getElementById("videoCallRiskAlerts");
+  const riskAlertKeys = new Set(); // 整通去重，别同一条疑点刷屏
+  const RISK_ALERTS_MAX = 8; // 明细列表最多留几条 DOM，再多挤掉最旧的
+
+  function clearRiskAlerts() {
+    riskAlertKeys.clear();
+    if (riskAlertsEl) {
+      riskAlertsEl.innerHTML = "";
+      riskAlertsEl.hidden = true;
+    }
+  }
+
+  function showRiskAlert(title, detail) {
+    if (!riskAlertsEl || !detail) return;
+    const key = `${title}|${detail}`;
+    if (riskAlertKeys.has(key)) return;
+    riskAlertKeys.add(key);
+
+    // 懒构建折叠结构（开新通话 clearRiskAlerts 清空后在此重建），默认折叠。
+    let summary = riskAlertsEl.querySelector(".vc-risk-summary");
+    let list = riskAlertsEl.querySelector(".vc-risk-list");
+    if (!summary || !list) {
+      riskAlertsEl.classList.add("collapsed");
+      summary = document.createElement("button");
+      summary.type = "button";
+      summary.className = "vc-risk-summary";
+      summary.addEventListener("click", () => riskAlertsEl.classList.toggle("collapsed"));
+      list = document.createElement("div");
+      list.className = "vc-risk-list";
+      riskAlertsEl.appendChild(summary);
+      riskAlertsEl.appendChild(list);
+    }
+
+    // 明细列表追加一条。
+    const block = document.createElement("div");
+    block.className = "vc-risk-alert";
+    const titleEl = document.createElement("span");
+    titleEl.className = "vc-risk-alert-title";
+    titleEl.textContent = title;
+    const detailEl = document.createElement("span");
+    detailEl.className = "vc-risk-alert-detail";
+    detailEl.textContent = detail;
+    block.appendChild(titleEl);
+    block.appendChild(detailEl);
+    list.appendChild(block);
+    while (list.childElementCount > RISK_ALERTS_MAX) list.firstElementChild.remove();
+
+    // 摘要条：累计总数（按去重后的 key 数，比 DOM 数准）+ 最新一条标题。
+    summary.innerHTML = "";
+    const label = document.createElement("span");
+    label.className = "vc-risk-summary-label";
+    label.textContent = `⚠ 风险提示 · ${riskAlertKeys.size} 处`;
+    const latest = document.createElement("span");
+    latest.className = "vc-risk-summary-latest";
+    latest.textContent = `最新：${title}`;
+    const chevron = document.createElement("span");
+    chevron.className = "vc-risk-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    summary.appendChild(label);
+    summary.appendChild(latest);
+    summary.appendChild(chevron);
+
+    if (!riskAlertsEl.classList.contains("collapsed")) list.scrollTop = list.scrollHeight;
+    riskAlertsEl.hidden = false;
   }
 
   let captionHideTimer = null;
@@ -378,6 +454,23 @@
           // 每轮自动看画面是静默的：只复位单飞闸门，让下一轮可以再看；不打扰字幕/状态。
           visionBusy = false;
           break;
+        case "risk.visual":
+          // 画面疑点警示：relay 已按"整通+措辞抖动"去重，只推真正新出现的疑点。
+          for (const a of ev.items || []) {
+            if (a) showRiskAlert("画面疑点", String(a));
+          }
+          break;
+        case "risk.contradiction": {
+          // relay 旁路检测命中"口述与档案不符"：弹红块给经办人看。
+          const c = ev.item || {};
+          if (c.stated || c.known) {
+            showRiskAlert(
+              "口述与档案不符" + (c.field ? "·" + c.field : ""),
+              `刚说："${c.stated || ""}" ↔ 档案："${c.known || ""}"`
+            );
+          }
+          break;
+        }
         case "error":
           setStatus("出错了：" + (ev.error?.message || ev.message || "未知"));
           break;
@@ -399,7 +492,7 @@
       analyser.connect(playCtx.destination);
       pollLevel();
       // worklet 模块必须在建节点前加载好（异步）。
-      await captureCtx.audioWorklet.addModule("/static/audio-worklet/pcm-recorder.js");
+      await captureCtx.audioWorklet.addModule("/static/shared/audio-worklet/pcm-recorder.js");
 
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {
@@ -619,6 +712,8 @@
     if (call.active) return;
     call.active = true;
     call.transcript = []; // 新通话，重置记录
+    call.startedAt = Date.now();
+    clearRiskAlerts(); // 上通的警示不带进新通话
     talkButton.textContent = "结束对话";
     if (muteButton) muteButton.disabled = false;
     showCaption("");
@@ -699,6 +794,12 @@
   // 关闭按钮/点遮罩：收尾对话（关闭弹窗由 chat.js 负责，observer 也会兜底 stop）。
   if (closeButton) closeButton.addEventListener("click", stopCall);
   if (backdrop) backdrop.addEventListener("click", stopCall);
+
+  // 异常关闭兜底：通话中直接关标签页/刷新时，stopCall 不会跑，用 pagehide +
+  // keepalive fetch 尽力把已累积的转写送出去（与正常挂断同一条路，幂等）。
+  window.addEventListener("pagehide", () => {
+    if (call.active) flushTranscript();
+  });
 
   // 预热语音列表（部分浏览器首次为空）。
   if (window.speechSynthesis) {

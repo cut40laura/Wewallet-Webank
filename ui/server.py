@@ -18,7 +18,7 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from config import (
     AUTH_COOKIE_NAME,
@@ -477,11 +477,50 @@ class Handler(BaseHTTPRequestHandler):
         getattr(self, handler_name)(user, enterprise)
         return True
 
+    # ── 前端分端（desktop / mobile）─────────────────────────────────────────
+    # 优先级：?ua= 强制参数（写 cookie 记住）> ui_variant cookie > User-Agent 嗅探。
+    # 开发调试用 /chat?ua=mobile / /chat?ua=desktop 即可在桌面浏览器看另一端。
+    UI_VARIANT_COOKIE = "ui_variant"
+
+    def detect_ui_variant(self) -> tuple[str, bool]:
+        """返回 (variant, 是否需要写 cookie)。variant ∈ {"desktop", "mobile"}。"""
+        query = parse_qs(self.path.partition("?")[2])
+        forced = (query.get("ua") or [""])[0].strip().lower()
+        if forced in ("desktop", "mobile"):
+            return forced, True
+        remembered = self.cookie_value(self.UI_VARIANT_COOKIE)
+        if remembered in ("desktop", "mobile"):
+            return remembered, False
+        agent = self.headers.get("User-Agent", "")
+        is_mobile = bool(re.search(r"Mobi|Android|iPhone|iPod|Windows Phone", agent, re.IGNORECASE))
+        return ("mobile" if is_mobile else "desktop"), False
+
+    def send_chat_page(self) -> None:
+        variant, remember = self.detect_ui_variant()
+        page = STATIC_DIR / variant / "chat.html"
+        if not page.exists() or not page.is_file():
+            self.send_error(404)
+            return
+        body = page.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        # 同一 URL 按 UA/cookie 返回不同内容，提示缓存层据此区分
+        self.send_header("Vary", "User-Agent, Cookie")
+        if remember:
+            self.send_header(
+                "Set-Cookie",
+                f"{self.UI_VARIANT_COOKIE}={variant}; Path=/; Max-Age=2592000; SameSite=Lax",
+            )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         try:
             path = unquote(self.path.split("?", 1)[0])
             if path in ("", "/", "/chat"):
-                self.send_file(STATIC_DIR / "chat.html", "text/html; charset=utf-8")
+                self.send_chat_page()
                 return
             if self._dispatch(self.GET_ROUTES, path):
                 return

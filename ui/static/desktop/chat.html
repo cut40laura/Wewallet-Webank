@@ -4,12 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WeWallet</title>
-  <link rel="icon" type="image/png" sizes="32x32" href="/static/assets/wewallet-favicon-32.png" />
-  <link rel="icon" type="image/png" sizes="64x64" href="/static/assets/wewallet-favicon-64.png" />
-  <link rel="icon" type="image/png" sizes="256x256" href="/static/assets/wewallet-favicon-256.png" />
-  <link rel="apple-touch-icon" href="/static/assets/wewallet-favicon-256.png" />
-  <link rel="icon" href="/static/assets/wewallet-favicon.ico" sizes="any" />
-  <link rel="stylesheet" href="/static/chat.css" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/shared/assets/wewallet-favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="64x64" href="/static/shared/assets/wewallet-favicon-64.png" />
+  <link rel="icon" type="image/png" sizes="256x256" href="/static/shared/assets/wewallet-favicon-256.png" />
+  <link rel="apple-touch-icon" href="/static/shared/assets/wewallet-favicon-256.png" />
+  <link rel="icon" href="/static/shared/assets/wewallet-favicon.ico" sizes="any" />
+  <link rel="stylesheet" href="/static/shared/tokens.css" />
+  <link rel="stylesheet" href="/static/desktop/chat.css" />
 </head>
 <body>
   <section id="authScreen" class="auth-screen" hidden>
@@ -134,7 +135,7 @@
       <header class="topbar">
         <div>
           <div class="topbar-title">
-            <img class="wewallet-wordmark" src="/static/assets/wewallet-wordmark-tight.png" alt="WeWallet" />
+            <img class="wewallet-wordmark" src="/static/shared/assets/wewallet-wordmark-tight.png" alt="WeWallet" />
           </div>
           <div class="topbar-subtitle">小微企业经营与融资服务</div>
         </div>
@@ -148,9 +149,9 @@
       <section id="messageList" class="message-list">
         <div class="empty-state">
           <div class="empty-mascot" aria-hidden="true">
-            <video class="mascot-video" autoplay muted loop playsinline preload="metadata" poster="/static/assets/mascot-smile.png">
-              <source src="/static/assets/character-loop.webm" type="video/webm" />
-              <img src="/static/assets/mascot-smile.png" alt="" />
+            <video class="mascot-video" autoplay muted loop playsinline preload="metadata" poster="/static/shared/assets/mascot-smile.png">
+              <source src="/static/shared/assets/character-loop.webm" type="video/webm" />
+              <img src="/static/shared/assets/mascot-smile.png" alt="" />
             </video>
           </div>
           <h1>聊聊您的生意和资金需求</h1>
@@ -323,7 +324,7 @@
       <!-- 顶部：小微身份 + 状态 + 关闭 -->
       <header class="video-call-topbar">
         <div class="video-call-peer">
-          <img class="video-call-peer-avatar" src="/static/assets/xiaowei-avatar-pro.png" alt="小微" />
+          <img class="video-call-peer-avatar" src="/static/shared/assets/xiaowei-avatar-pro.png" alt="小微" />
           <div class="video-call-peer-meta">
             <span class="video-call-peer-name">小微</span>
             <span id="videoCallStatus" class="video-call-peer-status">正在接通…</span>
@@ -331,6 +332,9 @@
         </div>
         <button id="closeVideoCallButton" class="video-call-close" type="button" aria-label="关闭视频通话">×</button>
       </header>
+
+      <!-- 实时风控警示：画面疑点 / 口述与档案不符（relay 旁路检测命中时弹出） -->
+      <div id="videoCallRiskAlerts" class="vc-risk-alerts" hidden></div>
 
       <!-- 中部：小微"在场"光球 + 聆听指示 + 字幕 -->
       <div class="video-call-center">
@@ -524,7 +528,10 @@
     </article>
   </template>
 
-  <script src="/static/chat.js"></script>
-  <script src="/static/voicecall.js"></script>
+  <!-- 加载顺序固定：纯函数层 → 业务核心层 → view 层 → 通话模块 -->
+  <script src="/static/shared/format.js"></script>
+  <script src="/static/shared/core.js"></script>
+  <script src="/static/desktop/chat.js"></script>
+  <script src="/static/desktop/voicecall.js"></script>
 </body>
 </html>
