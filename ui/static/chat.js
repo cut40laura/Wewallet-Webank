@@ -2220,7 +2220,9 @@ function openVideoCall() {
   });
 }
 
-function videoCallChannel() {
+// 用户这通视频通话的输入方式（说话 / 打字 / 两者都用）。注意：这不是"通话类型"，
+// 视频通话的 channel 恒为 "video"，这里只表达用户怎么和 AI 交互。
+function videoInputMode() {
   if (videoCall.usedVoice && videoCall.usedText) return "mixed";
   if (videoCall.usedText) return "text";
   return "voice";
@@ -2494,10 +2496,13 @@ function videoRenderRiskAlert(c) {
 }
 
 // 通话元数据（时长/通道/帧数）。挂断与异常关页两条路径共用。
-function videoBuildMetadata(observations, startedAtMs, channel) {
+// channel = 通话类型（"video" / "voice"）；input_mode = 用户这通的输入方式（"voice"/"text"/"mixed"）。
+// 两者是不同维度：视频通话里用户也可能全程只说话，那是 channel=video、input_mode=voice。
+function videoBuildMetadata(observations, startedAtMs, channel, inputMode) {
   return {
     duration_sec: Math.max(0, Math.round((Date.now() - startedAtMs) / 1000)),
     channel,
+    input_mode: inputMode || channel,
     frame_count: observations.length
   };
 }
@@ -2519,7 +2524,7 @@ function videoMergeContradictions(risk, contradictions) {
 
 // 挂断时：先向代理要风控总结（best-effort），再把整段记录补全落库。
 // 入参为快照，避免依赖随后被重置的 videoCall 状态。
-async function videoFinalizeCall(callId, transcript, observations, startedAtMs, channel, contradictions) {
+async function videoFinalizeCall(callId, transcript, observations, startedAtMs, channel, contradictions, inputMode) {
   if (!callId) return;
   const flagged = Array.isArray(contradictions) ? contradictions : [];
   // 风控总结只看结构化字段，不需要 base64 画面，剥掉以减小请求体。
@@ -2542,7 +2547,7 @@ async function videoFinalizeCall(callId, transcript, observations, startedAtMs, 
     // 风控总结失败不阻塞落库
   }
   risk = videoMergeContradictions(risk, flagged);
-  const metadata = videoBuildMetadata(observations, startedAtMs, channel);
+  const metadata = videoBuildMetadata(observations, startedAtMs, channel, inputMode);
   try {
     await postJson(`/api/video-call/${callId}/complete`, { transcript, observations: leanObservations, frames, risk, metadata });
   } catch (e) {
@@ -2626,8 +2631,9 @@ function closeVideoCall() {
       videoCall.transcriptLog,
       videoCall.observationsLog,
       videoCall.startedAtMs,
-      videoCallChannel(),
-      videoCall.contradictionsLog
+      "video",
+      videoCall.contradictionsLog,
+      videoInputMode()
     );
   }
   videoCall.callId = null;
@@ -2652,7 +2658,7 @@ window.addEventListener("beforeunload", () => {
     observations: leanObservations,
     frames,
     risk: videoMergeContradictions(null, videoCall.contradictionsLog),
-    metadata: videoBuildMetadata(videoCall.observationsLog, videoCall.startedAtMs, videoCallChannel())
+    metadata: videoBuildMetadata(videoCall.observationsLog, videoCall.startedAtMs, "video", videoInputMode())
   });
   try {
     navigator.sendBeacon(`/api/video-call/${videoCall.callId}/complete`, new Blob([body], { type: "application/json" }));

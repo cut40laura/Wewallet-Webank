@@ -6,9 +6,11 @@
   const DEFAULT_WS_URL = "ws://localhost:8870/v1/realtime-voice/stream";
   const DEFAULT_WORKLET_URL = "/static/audio-worklet/pcm-recorder.js";
 
-  // 打断（barge-in）本地 VAD 闸门
-  const BARGE_LEVEL = 0.14;
-  const BARGE_MIN_FRAMES = 8;
+  // 打断（barge-in）本地 VAD 闸门。
+  // 阈值调高、要求持续更久：AI 说长句时，回声/环境噪声不再被误判为"用户开口"而掐断播放。
+  // 只有明显且持续的真人语音（≥0.22 连续 14 帧）才打断 AI。
+  const BARGE_LEVEL = 0.22;
+  const BARGE_MIN_FRAMES = 14;
 
   function createEventId(prefix) {
     return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;

@@ -1,5 +1,4 @@
 import http from "node:http";
-import https from "node:https";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -17,10 +16,6 @@ try {
 
 const PORT = Number(process.env.DOUBAO_REALTIME_PROXY_PORT || 8870);
 const HOST = process.env.DOUBAO_REALTIME_PROXY_HOST || "127.0.0.1";
-// TLS（wss/https）：当页面经 HTTPS 打开时，浏览器禁止从中连 ws://（mixed-content），
-// 因此对外暴露的代理也必须是 wss。提供证书/私钥路径即启用 TLS；本地开发留空走 http/ws。
-const TLS_CERT_PATH = process.env.DOUBAO_REALTIME_PROXY_TLS_CERT || "";
-const TLS_KEY_PATH = process.env.DOUBAO_REALTIME_PROXY_TLS_KEY || "";
 const API_KEY = process.env.DOUBAO_REALTIME_API_KEY || "";
 const APP_ID = process.env.DOUBAO_REALTIME_APP_ID || "";
 const ACCESS_KEY = process.env.DOUBAO_REALTIME_ACCESS_KEY || "";
@@ -31,6 +26,15 @@ const INPUT_MOD = process.env.DOUBAO_REALTIME_INPUT_MOD || "audio";
 const UPSTREAM_URL =
   process.env.DOUBAO_REALTIME_WS_URL ||
   "wss://openspeech.bytedance.com/api/v3/realtime/dialogue";
+
+// 服务端打断门控：上游 ASR 识别到的文字达到此长度，才算"用户真的开口"，
+// 才允许停播/打断 AI。过短（多半是回声、杂音、半个字）一律不打断，避免长句被半截掐断、
+// 也避免拿误识别的内容去触发回答。
+const MIN_BARGE_CHARS = 2;
+function asrTextOf(frame) {
+  if (!frame || frame.event !== EVENT_RECEIVE.ASRResponse) return "";
+  return (frame.json?.results || []).map((r) => r && r.text).filter(Boolean).join("").trim();
+}
 
 // 视频通话：亲和的客户经理，先陪聊、暗中兼顾反欺诈。实时语音模型自己看不清画面，但页面会在需要时注入 Seed 视觉结果。
 const VIDEO_SYSTEM_ROLE =
@@ -80,8 +84,6 @@ const EVENT_RECEIVE = {
   DialogCommonError: 599
 };
 
-// 启用 TLS 时用 https.createServer（wss），否则普通 http（本地开发）。
-const TLS_ENABLED = Boolean(TLS_CERT_PATH && TLS_KEY_PATH);
 const requestHandler = (req, res) => {
   // 浏览器从 Python(UI 端口) 调本代理(:8870) 是跨域，统一放行
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -120,13 +122,8 @@ const requestHandler = (req, res) => {
   });
 };
 
-// 有证书则起 https（wss），否则普通 http（本地开发）。
-const server = TLS_ENABLED
-  ? https.createServer(
-      { cert: readFileSync(TLS_CERT_PATH), key: readFileSync(TLS_KEY_PATH) },
-      requestHandler,
-    )
-  : http.createServer(requestHandler);
+// 公网 TLS 由 Caddy 终止，本进程始终 http/ws（生产经 Caddy /rtc 反代，本地直连）。
+const server = http.createServer(requestHandler);
 
 const wss = new WebSocketServer({ server, path: "/v1/realtime-voice/stream" });
 
@@ -155,6 +152,7 @@ wss.on("connection", (client, request) => {
   let sessionStarted = false;
   let aiSpeaking = false; // AI 是否正在播报（用于打断）
   let suppressTurnUntil = 0; // >now 表示当前轮是"静默喂画面"，吞掉它的播报不下发给前端
+  let pendingContext = null; // AI 正在播报时到来的画面注入，缓存到这句播完(TTSEnded)再喂，避免打断语音
 
   upstream.on("open", () => {
     upstreamReady = true;
@@ -174,8 +172,9 @@ wss.on("connection", (client, request) => {
       return;
     }
 
-    // 用户一开口就解除静默，避免把用户这轮的真实回答也吞掉
-    if (frame.event === EVENT_RECEIVE.ASRResponse) suppressTurnUntil = 0;
+    // 用户真的开口（识别到足够长文字）才解除静默，避免回声/杂音误触把喂画面那轮的播报放出来
+    const asrSubstantial = asrTextOf(frame).length >= MIN_BARGE_CHARS;
+    if (frame.event === EVENT_RECEIVE.ASRResponse && asrSubstantial) suppressTurnUntil = 0;
 
     const translated = translateDoubaoFrame(frame);
     const suppressing = suppressTurnUntil > Date.now();
@@ -197,8 +196,15 @@ wss.on("connection", (client, request) => {
     } else if (frame.event === EVENT_RECEIVE.TTSEnded || frame.event === EVENT_RECEIVE.ChatEnded) {
       aiSpeaking = false;
     }
-    // 用户开口（ASR）时若 AI 正在说 → 打断上游，让它停下来听用户最新的话
-    if (frame.event === EVENT_RECEIVE.ASRResponse && aiSpeaking && sessionStarted) {
+    // 这句语音真正播完了：若期间攒下了画面注入，现在补喂——此刻不会打断任何正在播的语音。
+    if (frame.event === EVENT_RECEIVE.TTSEnded && pendingContext && sessionStarted && upstream.readyState === WebSocket.OPEN) {
+      const text = pendingContext;
+      pendingContext = null;
+      suppressTurnUntil = Date.now() + 8000;
+      upstream.send(makeFullClientFrame(EVENT_SEND.ChatTextQuery, { content: text }, sessionId));
+    }
+    // 用户真的开口（识别到足够长文字）且 AI 正在说 → 打断上游；过短不打断，防长句被半截掐断
+    if (frame.event === EVENT_RECEIVE.ASRResponse && asrSubstantial && aiSpeaking && sessionStarted) {
       upstream.send(makeFullClientFrame(EVENT_SEND.ClientInterrupt, {}, sessionId));
       aiSpeaking = false;
     }
@@ -262,6 +268,12 @@ wss.on("connection", (client, request) => {
 
     // 静默喂画面：作为文本查询送进豆包（更新其对话上下文），但本轮播报会被吞掉不下发。
     if (payload.type === "context_text" && payload.text && sessionStarted) {
+      // AI 正在播报时不能立刻喂——会打断当前语音（表现为长句播到一半突然停）。
+      // 先缓存最新一帧，等这句播完(TTSEnded)再补喂。
+      if (aiSpeaking) {
+        pendingContext = String(payload.text);
+        return;
+      }
       suppressTurnUntil = Date.now() + 8000; // 安全上限，防漏掉结束事件后一直静音
       upstream.send(makeFullClientFrame(EVENT_SEND.ChatTextQuery, { content: String(payload.text) }, sessionId));
       return;
@@ -282,7 +294,7 @@ wss.on("connection", (client, request) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Doubao realtime proxy listening on ${TLS_ENABLED ? "wss" : "ws"}://${HOST}:${PORT}/v1/realtime-voice/stream`);
+  console.log(`Doubao realtime proxy listening on ws://${HOST}:${PORT}/v1/realtime-voice/stream`);
 });
 
 // ============ 视频通话·视觉理解 /api/vision（豆包 ARK → Qwen 降级 → mock） ============
@@ -847,9 +859,12 @@ function translateDoubaoFrame(frame) {
   } else if (frame.event === EVENT_RECEIVE.SessionStarted) {
     payloads.push({ type: "proxy.upstream_session_started", dialog_id: data.dialog_id || "" });
   } else if (frame.event === EVENT_RECEIVE.ASRResponse) {
-    // 用户开口 → 通知前端停播 AI（打断）
-    payloads.push({ type: "input_audio_buffer.speech_started" });
-    const text = (data.results || []).map((item) => item.text).filter(Boolean).join("");
+    const text = (data.results || []).map((item) => item.text).filter(Boolean).join("").trim();
+    // 只有识别到足够长的文字，才通知前端"用户开口、停播 AI"；过短多半是回声/杂音，不停播。
+    if (text.length >= MIN_BARGE_CHARS) {
+      payloads.push({ type: "input_audio_buffer.speech_started" });
+    }
+    // 转写照常下发（用最新全文替换显示），但不因短噪声触发停播。
     if (text) payloads.push({ type: "input_audio_transcription.delta", delta: text, is_interim: Boolean(data.results?.some((item) => item.is_interim)) });
   } else if (frame.event === EVENT_RECEIVE.ChatResponse) {
     if (data.content) payloads.push({ type: "response.text.delta", delta: data.content, question_id: data.question_id, reply_id: data.reply_id });
