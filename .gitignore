@@ -40,8 +40,8 @@ __pycache__/
 customer-risk-profile.md
 风控经理测试档案.md
 基于hermes的客户经理智能体100轮对话测试.md
-execute_100_round_test.py
-run_100_round_test.py
+scripts/execute_100_round_test.py
+scripts/run_100_round_test.py
 run-customer-manager.sh
 output/
 

@@ -9,13 +9,15 @@ import mimetypes
 import os
 import re
 import secrets
+import sys
 import time
+import traceback
 import uuid
 from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote
 
 from config import (
@@ -109,6 +111,9 @@ from wallet import (
 import threading
 
 
+EmitFn = Callable[[str, dict[str, Any]], None]
+
+
 def _asr_progress_events(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Surface ASR only when it failed.
 
@@ -163,7 +168,7 @@ def _schedule_image_ingest(enterprise_id: str, image_attachments: list[dict[str,
     threading.Thread(target=worker, name=f"image-ingest-{enterprise_id}", daemon=True).start()
 
 
-def _stream_text_chunks(text: str, emit: Any, *, delay_s: float = 0.012) -> None:
+def _stream_text_chunks(text: str, emit: EmitFn, *, delay_s: float = 0.012) -> None:
     """Fallback visual streaming for providers that only return final text."""
     for char in text:
         emit("message.delta", {"text": char})
@@ -226,7 +231,187 @@ def _ensure_latest_suggestions(
     return suggestions
 
 
+def run_chat_turn(
+    enterprise_id: str,
+    enterprise: dict[str, Any],
+    user_message: str,
+    attachments: list[dict[str, Any]],
+    *,
+    emit: EmitFn | None = None,
+) -> dict[str, Any]:
+    """One chat turn: knowledge search → image KB → gateway → suggestions → persist.
+
+    Shared by ``/api/chat`` (emit=None) and ``/api/chat/stream`` (emit writes
+    NDJSON events). Keeping a single pipeline means a behavior fix in one
+    endpoint can't silently miss the other.
+
+    Returns the payload both endpoints hand back to the client:
+    ``{"messages", "auto_profile", "wallet_pending"}``.
+    """
+    messages = load_messages(enterprise_id)
+    display_message = display_user_message(user_message, attachments)
+    image_attachments = [item for item in attachments if item.get("kind") == "image"]
+    image_paths = [str(item["path"]) for item in image_attachments]
+
+    asr_events = _asr_progress_events(attachments)
+    if emit:
+        for ev in asr_events:
+            emit(ev["type"], {"name": ev.get("name"), "tool_id": ev.get("tool_id"), "preview": ev.get("text")})
+
+    if emit:
+        emit("tool.start", {"name": "本地知识库", "tool_id": "local-knowledge"})
+    knowledge_started_at = time.monotonic()
+    try:
+        knowledge_hits = KNOWLEDGE.search(display_message, top_k=KNOWLEDGE_TOP_K)
+    except Exception as exc:
+        if emit:
+            emit("tool.complete", {
+                "name": "本地知识库",
+                "tool_id": "local-knowledge",
+                "duration_s": time.monotonic() - knowledge_started_at,
+                "error": str(exc),
+            })
+        raise
+    knowledge_duration = time.monotonic() - knowledge_started_at
+    if emit:
+        emit("tool.progress", {"name": "本地知识库", "preview": summarize_knowledge_hits(knowledge_hits)})
+        emit("tool.complete", {
+            "name": "本地知识库",
+            "tool_id": "local-knowledge",
+            "duration_s": knowledge_duration,
+        })
+    local_progress = asr_events + knowledge_progress_events(knowledge_hits, knowledge_duration)
+
+    image_kb = image_kb_for_enterprise(enterprise_id)
+    if emit:
+        emit("tool.start", {"name": "客户历史图档", "tool_id": "image-history"})
+    image_kb_started_at = time.monotonic()
+    try:
+        image_hits = image_kb.search(
+            text=display_message,
+            image_paths=image_paths,
+            top_k=IMAGE_KB_TOP_K,
+            exclude_paths=image_paths,
+        )
+    except Exception as exc:
+        # 图档检索失败不致命：跳过图档继续走纯文本/知识库流程。
+        image_hits = []
+        if emit:
+            emit("tool.complete", {
+                "name": "客户历史图档",
+                "tool_id": "image-history",
+                "duration_s": time.monotonic() - image_kb_started_at,
+                "error": str(exc),
+            })
+    else:
+        image_kb_duration = time.monotonic() - image_kb_started_at
+        if emit:
+            emit("tool.progress", {"name": "客户历史图档", "preview": summarize_image_hits(image_hits)})
+            emit("tool.complete", {
+                "name": "客户历史图档",
+                "tool_id": "image-history",
+                "duration_s": image_kb_duration,
+            })
+        local_progress = local_progress + image_kb_progress_events(image_hits, image_kb_duration)
+
+    gateway_delta_count = 0
+    gateway_emit: EmitFn | None = None
+    if emit:
+        def gateway_emit(event_type: str, payload: dict[str, Any]) -> None:
+            nonlocal gateway_delta_count
+            if event_type == "message.delta":
+                gateway_delta_count += 1
+            emit(event_type, payload)
+
+    result = gateway_for_enterprise(enterprise_id).submit(
+        f"chat:{enterprise_id}",
+        build_gateway_chat_turn(messages, display_message, enterprise, knowledge_hits, image_hits, attachments),
+        image_paths=image_paths,
+        event_callback=gateway_emit,
+    )
+    cleaned_content, upload_request = extract_upload_request(result["content"])
+    if emit and gateway_delta_count == 0 and cleaned_content.strip():
+        _stream_text_chunks(cleaned_content, emit)
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": cleaned_content,
+        "thinking": result["thinking"],
+        "progress": local_progress + result["progress"],
+        "inline_diffs": result["inline_diffs"],
+    }
+    if upload_request:
+        assistant_message["upload_request"] = upload_request
+    suggestions = _generate_suggestions(
+        enterprise_id,
+        messages,
+        display_message,
+        cleaned_content,
+        enterprise,
+    )
+    if suggestions:
+        assistant_message["suggestions"] = suggestions
+    new_messages = [
+        {"role": "user", "content": display_message, "attachments": attachments},
+        assistant_message,
+    ]
+    append_messages(enterprise_id, new_messages)
+    messages.extend(new_messages)
+    if image_attachments:
+        _schedule_image_ingest(enterprise_id, image_attachments)
+    auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
+    return {
+        "messages": messages,
+        "auto_profile": auto_profile,
+        "wallet_pending": load_pending(enterprise_id),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
+    # ── 路由表 ────────────────────────────────────────────────────────────
+    # path -> (handler 方法名, 认证级别)。认证级别声明式地写在路由上，
+    # dispatcher 统一校验，handler 拿到的就是已验证的 user/enterprise——
+    # 不会再出现"新端点忘了加 current_context()"的漏洞。
+    #   public:     无需登录（handler 收到 user=None, enterprise=None）
+    #   user:       需登录（enterprise 可能为 None）
+    #   enterprise: 需登录且已绑定企业
+    GET_ROUTES: dict[str, tuple[str, str]] = {
+        "/healthz": ("get_healthz", "public"),
+        "/api/voicecall/realtime-config": ("get_voicecall_realtime_config", "public"),
+        "/api/auth/me": ("get_auth_me", "public"),
+        "/api/messages": ("get_messages", "enterprise"),
+        "/api/profile": ("get_profile", "enterprise"),
+        "/api/loan/estimate": ("get_loan_estimate", "enterprise"),
+        "/api/account/profile": ("get_account_profile", "enterprise"),
+        "/api/wallet": ("get_wallet", "enterprise"),
+        "/api/wallet/pending": ("get_wallet_pending", "enterprise"),
+        "/api/knowledge/status": ("get_knowledge_status", "user"),
+        "/api/image-knowledge/status": ("get_image_knowledge_status", "enterprise"),
+    }
+    POST_ROUTES: dict[str, tuple[str, str]] = {
+        "/api/auth/sms/send": ("post_auth_sms_send", "public"),
+        "/api/auth/sms/verify": ("post_auth_sms_verify", "public"),
+        "/api/auth/password/login": ("post_auth_password_login", "public"),
+        "/api/auth/register": ("post_auth_register", "public"),
+        "/api/auth/logout": ("post_auth_logout", "public"),
+        "/api/messages/suggestions": ("post_messages_suggestions", "enterprise"),
+        "/api/voicecall": ("post_voicecall", "enterprise"),
+        "/api/voicecall/end": ("post_voicecall_end", "enterprise"),
+        "/api/account/profile": ("post_account_profile", "enterprise"),
+        "/api/account/avatar": ("post_account_avatar", "enterprise"),
+        "/api/wallet/transaction": ("post_wallet_transaction", "enterprise"),
+        "/api/wallet/import": ("post_wallet_import", "enterprise"),
+        "/api/enterprise/create": ("post_enterprise_create", "user"),
+        "/api/chat": ("post_chat", "enterprise"),
+        "/api/chat/stream": ("post_chat_stream", "enterprise"),
+        # 重建索引是重操作（全量 embedding），必须登录才能触发。
+        "/api/knowledge/reindex": ("post_knowledge_reindex", "user"),
+        "/api/image-knowledge/reindex": ("post_image_knowledge_reindex", "enterprise"),
+        "/api/reset": ("post_reset", "enterprise"),
+        "/api/loan/estimate": ("post_loan_estimate", "enterprise"),
+        "/api/profile/refresh": ("post_profile_refresh", "enterprise"),
+    }
+
+    # ── 认证 / 公共上下文 ─────────────────────────────────────────────────
     def cookie_value(self, name: str) -> str:
         cookie = self.headers.get("Cookie", "")
         for part in cookie.split(";"):
@@ -270,112 +455,49 @@ class Handler(BaseHTTPRequestHandler):
             "needs_enterprise": enterprise is None,
         }
 
+    # ── 分发 ──────────────────────────────────────────────────────────────
+    def _dispatch(self, routes: dict[str, tuple[str, str]], path: str) -> bool:
+        """Look up ``path`` in the route table; resolve auth, then call the handler.
+
+        Returns False when the path is not in the table (caller falls through
+        to prefix routes / 404).
+        """
+        entry = routes.get(path)
+        if not entry:
+            return False
+        handler_name, auth_level = entry
+        user: dict[str, Any] | None = None
+        enterprise: dict[str, Any] | None = None
+        if auth_level == "user":
+            user = self.current_user()
+        elif auth_level == "enterprise":
+            user, enterprise = self.current_context()
+        getattr(self, handler_name)(user, enterprise)
+        return True
+
     def do_GET(self) -> None:
         try:
             path = unquote(self.path.split("?", 1)[0])
             if path in ("", "/", "/chat"):
                 self.send_file(STATIC_DIR / "chat.html", "text/html; charset=utf-8")
                 return
-            if path == "/healthz":
-                self.send_json({"ok": True})
-                return
-            if path == "/api/voicecall/realtime-config":
-                # 告诉前端通话语音走哪条路 + 实时中继地址 + 访问令牌（仅发给已登录用户）。
-                # 令牌现在**绑定该用户的 enterprise_id 并带时效**：既防公网盗用，又让中继
-                # 认得出是哪个企业在通话，从而注入与主聊天共享的客户记忆（见 voicecall.mint_call_token）。
-                auth_user = verify_auth_token(self.cookie_value(AUTH_COOKIE_NAME))
-                enterprise_id = str((auth_user or {}).get("enterprise_id") or "")
-                # 必须已登录、已绑企业，才能拿到带记忆的令牌（无企业则没有可共享的记忆）。
-                enabled = bool(enterprise_id) and VOICECALL_VOICE_BACKEND == "realtime" and realtime_voice_ready()
-                self.send_json({
-                    "backend": "realtime" if enabled else "placeholder",
-                    "enabled": enabled,
-                    "relay_port": VOICECALL_RELAY_PORT,
-                    # ws_url(完整) > relay_path(同源路径) > 按 host:relay_port 自拼（本地）。
-                    "ws_url": VOICECALL_RELAY_PUBLIC_URL,
-                    "relay_path": VOICECALL_RELAY_PATH,
-                    "token": mint_call_token(enterprise_id) if enabled else "",
-                })
-                return
-            if path == "/api/auth/me":
-                self.send_json(self.auth_payload())
-                return
-            if path == "/api/messages":
-                _user, enterprise = self.current_context()
-                self.send_json({"messages": load_messages(str(enterprise["id"]))})
-                return
-            if path == "/api/profile":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                profile_path, markdown = load_profile_markdown(enterprise_id)
-                state = load_profile_state(enterprise_id)
-                self.send_json({
-                    "path": str(profile_path),
-                    "markdown": markdown,
-                    "state": {
-                        "in_progress": bool(state.get("in_progress")),
-                        "last_profile_updated_at": state.get("last_profile_updated_at") or "",
-                        "last_profile_trigger": state.get("last_profile_trigger") or "",
-                        "last_profile_changed": bool(state.get("last_profile_changed")),
-                        "last_error": state.get("last_error") or "",
-                    },
-                })
-                return
-            if path == "/api/loan/estimate":
-                _user, enterprise = self.current_context()
-                self.send_json({"estimate": load_loan_estimate(str(enterprise["id"]))})
-                return
-            if path == "/api/account/profile":
-                user, enterprise = self.current_context()
-                self.send_json({"profile": load_account_profile(user, enterprise)})
-                return
-            if path == "/api/wallet":
-                _user, enterprise = self.current_context()
-                transactions = load_wallet_transactions(str(enterprise["id"]))
-                self.send_json({"transactions": transactions, "summary": wallet_summary(transactions)})
-                return
-            if path == "/api/wallet/pending":
-                _user, enterprise = self.current_context()
-                self.send_json({"pending": load_pending(str(enterprise["id"]))})
-                return
-            if path == "/api/knowledge/status":
-                self.send_json(KNOWLEDGE.status())
-                return
-            if path == "/api/image-knowledge/status":
-                _user, enterprise = self.current_context()
-                self.send_json(image_kb_for_enterprise(str(enterprise["id"])).status())
+            if self._dispatch(self.GET_ROUTES, path):
                 return
             if path.startswith("/static/"):
-                target = (STATIC_DIR / path.removeprefix("/static/")).resolve()
-                try:
-                    target.relative_to(STATIC_DIR.resolve())
-                except ValueError:
-                    self.send_error(403)
-                    return
-                self.send_file(target, self.content_type(target))
+                self.get_static(path)
                 return
             if path.startswith("/uploads/"):
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                upload_path = path.removeprefix("/uploads/")
-                if not upload_path.startswith(f"{enterprise_id}/"):
-                    self.send_error(403)
-                    return
-                target = (enterprise_uploads_dir(enterprise_id) / upload_path.removeprefix(f"{enterprise_id}/")).resolve()
-                try:
-                    target.relative_to(enterprise_uploads_dir(enterprise_id).resolve())
-                except ValueError:
-                    self.send_error(403)
-                    return
-                self.send_file(target, self.content_type(target))
+                self.get_upload(path)
                 return
             self.send_error(404)
         except EnterpriseRequired as exc:
             self.send_json({"error": str(exc), "needs_enterprise": True}, status=403)
         except AuthError as exc:
             self.send_json({"error": str(exc), "authenticated": False}, status=401)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, status=500)
+            self.send_internal_error(exc)
 
     def do_POST(self) -> None:
         try:
@@ -392,349 +514,247 @@ class Handler(BaseHTTPRequestHandler):
                 if not check_rate_limit(client_ip, bucket):
                     self.send_json({"error": "请求过于频繁，请稍后再试"}, status=429)
                     return
-            if self.path == "/api/auth/sms/send":
-                payload = self.read_json()
-                phone = normalize_phone(str(payload.get("phone", "")))
-                code = create_sms_code(phone)
-                if code is None:
-                    self.send_json({"error": "验证码发送过于频繁，请稍后再试"}, status=429)
-                    return
-                send_sms_code(phone, code)
-                payload = {"ok": True, "expires_in": SMS_CODE_TTL_SECONDS}
-                if is_truthy(os.environ.get("WEWALLET_SMS_DEBUG", "1")):
-                    payload["debug_code"] = code
-                self.send_json(payload)
-                return
-            if self.path == "/api/auth/sms/verify":
-                payload = self.read_json()
-                phone = normalize_phone(str(payload.get("phone", "")))
-                code = re.sub(r"\D+", "", str(payload.get("code", "")))
-                if len(code) != 6:
-                    self.send_json({"error": "请输入 6 位验证码"}, status=400)
-                    return
-                if not consume_sms_code(phone, code):
-                    self.send_json({"error": "验证码错误或已过期"}, status=400)
-                    return
-                user = find_user_by_phone(phone)
-                if not user:
-                    self.send_json({"error": "该手机号未注册，请先注册"}, status=404)
-                    return
-                user = mark_user_logged_in(str(user["id"]))
-                token = create_auth_session(str(user["id"]))
-                self.send_json_with_cookie(self.auth_payload_for_user(user), token=token)
-                return
-            if self.path == "/api/auth/password/login":
-                payload = self.read_json()
-                phone = normalize_phone(str(payload.get("phone", "")))
-                password = str(payload.get("password", ""))
-                user = find_user_by_phone(phone)
-                if not user or not verify_password(password, str(user.get("password_hash") or "")):
-                    self.send_json({"error": "手机号或密码错误"}, status=400)
-                    return
-                user = mark_user_logged_in(str(user["id"]))
-                token = create_auth_session(str(user["id"]))
-                self.send_json_with_cookie(self.auth_payload_for_user(user), token=token)
-                return
-            if self.path == "/api/auth/register":
-                payload = self.read_json()
-                phone = normalize_phone(str(payload.get("phone", "")))
-                password = validate_password(str(payload.get("password", "")))
-                code = re.sub(r"\D+", "", str(payload.get("code", "")))
-                if len(code) != 6:
-                    self.send_json({"error": "请输入 6 位验证码"}, status=400)
-                    return
-                if not consume_sms_code(phone, code):
-                    self.send_json({"error": "验证码错误或已过期"}, status=400)
-                    return
-                user = create_user(phone, password)
-                token = create_auth_session(str(user["id"]))
-                self.send_json_with_cookie(self.auth_payload_for_user(user), token=token)
-                return
-            if self.path == "/api/auth/logout":
-                revoke_auth_token(self.cookie_value(AUTH_COOKIE_NAME))
-                self.send_json_with_cookie({"ok": True}, token="")
-                return
-            if self.path == "/api/messages/suggestions":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                messages = load_messages(enterprise_id)
-                suggestions = _ensure_latest_suggestions(enterprise_id, messages, enterprise)
-                self.send_json({"ok": True, "messages": messages, "suggestions": suggestions})
-                return
-            if self.path == "/api/voicecall":
-                # 视频通话模块（通话版小微）。与主聊天共享同一份记忆：按 enterprise_id
-                # 取画像+近期对话当"开场记忆"注入，让通话小微一接通就认得这位客户。
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                payload = self.read_json()
-                transcript = str(payload.get("transcript", "")).strip()
-                frame = str(payload.get("frame", "")).strip()  # data:image/...;base64,
-                history = payload.get("history") if isinstance(payload.get("history"), list) else []
-                if not transcript and not frame:
-                    self.send_json({"error": "transcript 不能为空"}, status=400)
-                    return
-                memory_context = build_call_memory_context(enterprise_id, load_messages(enterprise_id))
-                reply = call_xiaowei(transcript, history, frame, memory_context)
-                self.send_json({"ok": True, "reply": reply})
-                return
-            if self.path == "/api/voicecall/end":
-                # 挂断回流：把这通通话的对话清洗后并入主聊天时间线（channel:voice），
-                # 再触发画像更新——于是通话里说过的事，回到文字聊天小微也"记得"。
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                payload = self.read_json()
-                turns = payload.get("transcript") if isinstance(payload.get("transcript"), list) else []
-                normalized, stats = normalize_transcript(turns)
-                voice_messages = []
-                for turn in normalized or []:
-                    role = "assistant" if turn.get("role") == "ai" else "user"
-                    content = str(turn.get("content") or turn.get("text") or "").strip()
-                    if content:
-                        voice_messages.append({"role": role, "content": content, "channel": "voice"})
-                auto_profile = None
-                if voice_messages:
-                    append_messages(enterprise_id, voice_messages)
-                    messages = load_messages(enterprise_id)
-                    auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
-                self.send_json({"ok": True, "saved": len(voice_messages), "auto_profile": auto_profile})
-                return
-            if self.path == "/api/account/profile":
-                user, enterprise = self.current_context()
-                profile = save_account_profile(user, enterprise, self.read_json())
-                self.send_json({"ok": True, "profile": profile, "auth": self.auth_payload_for_user(user)})
-                return
-            if self.path == "/api/account/avatar":
-                user, enterprise = self.current_context()
-                profile = self.save_account_avatar(user, enterprise)
-                self.send_json({"ok": True, "profile": profile, "auth": self.auth_payload_for_user(user)})
-                return
-            if self.path == "/api/wallet/transaction":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                payload = self.read_json()
-                with wallet_lock(enterprise_id):
-                    transactions = load_wallet_transactions(enterprise_id)
-                    transactions.append(normalize_wallet_transaction(payload))
-                    save_wallet_transactions(enterprise_id, transactions)
-                self.send_json({"ok": True, "transactions": transactions, "summary": wallet_summary(transactions)})
-                return
-            if self.path == "/api/wallet/import":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                with wallet_lock(enterprise_id):
-                    transactions = self.import_wallet_csv(enterprise_id)
-                self.send_json({"ok": True, "transactions": transactions, "summary": wallet_summary(transactions)})
-                return
-            if self.path == "/api/enterprise/create":
-                user = self.current_user()
-                payload = self.read_json()
-                enterprise = create_enterprise_for_user(
-                    user,
-                    str(payload.get("name", "")),
-                    str(payload.get("credit_code", "")),
-                )
-                self.send_json({"ok": True, "enterprise": enterprise, "auth": self.auth_payload()})
-                return
-            if self.path == "/api/chat":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                user_message, attachments = self.read_chat_submission(enterprise_id)
-                if not user_message and not attachments:
-                    self.send_json({"error": "message 不能为空"}, status=400)
-                    return
-                display_message = display_user_message(user_message, attachments)
-                image_attachments = [item for item in attachments if item.get("kind") == "image"]
-                image_paths = [str(item["path"]) for item in image_attachments]
-                messages = load_messages(enterprise_id)
-                local_progress = _asr_progress_events(attachments)
-                knowledge_started_at = time.monotonic()
-                knowledge_hits = KNOWLEDGE.search(display_message, top_k=KNOWLEDGE_TOP_K)
-                local_progress.extend(knowledge_progress_events(knowledge_hits, time.monotonic() - knowledge_started_at))
-                image_kb = image_kb_for_enterprise(enterprise_id)
-                image_kb_started_at = time.monotonic()
-                try:
-                    image_hits = image_kb.search(
-                        text=display_message,
-                        image_paths=image_paths,
-                        top_k=IMAGE_KB_TOP_K,
-                        exclude_paths=image_paths,
-                    )
-                except Exception:
-                    image_hits = []
-                local_progress.extend(
-                    image_kb_progress_events(image_hits, time.monotonic() - image_kb_started_at)
-                )
-                result = gateway_for_enterprise(enterprise_id).submit(
-                    f"chat:{enterprise_id}",
-                    build_gateway_chat_turn(messages, display_message, enterprise, knowledge_hits, image_hits, attachments),
-                    image_paths=image_paths,
-                )
-                cleaned_content, upload_request = extract_upload_request(result["content"])
-                assistant_message: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": cleaned_content,
-                    "thinking": result["thinking"],
-                    "progress": local_progress + result["progress"],
-                    "inline_diffs": result["inline_diffs"],
-                }
-                if upload_request:
-                    assistant_message["upload_request"] = upload_request
-                suggestions = _generate_suggestions(
-                    enterprise_id,
-                    messages,
-                    display_message,
-                    cleaned_content,
-                    enterprise,
-                )
-                if suggestions:
-                    assistant_message["suggestions"] = suggestions
-                new_messages = [
-                    {"role": "user", "content": display_message, "attachments": attachments},
-                    assistant_message,
-                ]
-                append_messages(enterprise_id, new_messages)
-                messages.extend(new_messages)
-                if image_attachments:
-                    _schedule_image_ingest(enterprise_id, image_attachments)
-                auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
-                self.send_json({
-                    "messages": messages,
-                    "auto_profile": auto_profile,
-                    "wallet_pending": load_pending(enterprise_id),
-                })
-                return
-            if self.path == "/api/chat/stream":
-                self.handle_chat_stream()
-                return
-            if self.path == "/api/knowledge/reindex":
-                self.send_json(KNOWLEDGE.rebuild())
-                return
-            if self.path == "/api/image-knowledge/reindex":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                self.send_json(
-                    image_kb_for_enterprise(enterprise_id).rebuild_from_uploads(
-                        enterprise_uploads_dir(enterprise_id)
-                    )
-                )
+            if self._dispatch(self.POST_ROUTES, self.path):
                 return
             if self.path.startswith("/api/wallet/pending/"):
-                tail = self.path[len("/api/wallet/pending/"):]
-                pending_id, _, action = tail.partition("/")
-                if action not in {"confirm", "reject"} or not pending_id:
-                    self.send_json({"error": "无效的 pending 操作路径"}, status=400)
-                    return
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                try:
-                    with wallet_lock(enterprise_id):
-                        if action == "confirm":
-                            result = apply_pending(enterprise_id, pending_id)
-                        else:
-                            result = reject_pending(enterprise_id, pending_id)
-                except KeyError:
-                    self.send_json({"error": "该提案已被处理或不存在"}, status=404)
-                    return
-                except (ValueError, RuntimeError) as exc:
-                    self.send_json({"error": str(exc)}, status=400)
-                    return
-                transactions = load_wallet_transactions(enterprise_id)
-                self.send_json({
-                    "ok": True,
-                    "action": action,
-                    "result": result,
-                    "pending": load_pending(enterprise_id),
-                    "transactions": transactions,
-                    "summary": wallet_summary(transactions),
-                })
-                return
-            if self.path == "/api/reset":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                clear_messages(enterprise_id)
-                gateway_for_enterprise(enterprise_id).reset_session(f"chat:{enterprise_id}")
-                self.send_json({"ok": True})
-                return
-            if self.path == "/api/loan/estimate":
-                _user, enterprise = self.current_context()
-                estimate = run_loan_estimate(str(enterprise["id"]), enterprise)
-                self.send_json({"estimate": estimate})
-                return
-            if self.path == "/api/profile/refresh":
-                _user, enterprise = self.current_context()
-                enterprise_id = str(enterprise["id"])
-                messages = load_messages(enterprise_id)
-                turn_count = user_turn_count(messages)
-                state = load_profile_state(enterprise_id)
-                last_done = int(state.get("last_profile_user_turn_count", 0) or 0)
-                last_updated_at = state.get("last_profile_updated_at") or ""
-                snapshot = {
-                    "in_progress": bool(state.get("in_progress")),
-                    "last_profile_updated_at": last_updated_at,
-                    "last_profile_trigger": state.get("last_profile_trigger") or "",
-                    "last_profile_changed": bool(state.get("last_profile_changed")),
-                    "last_error": state.get("last_error") or "",
-                }
-
-                if turn_count <= 0:
-                    self.send_json({
-                        "status": "no_messages",
-                        "message": "还没有对话内容，画像会在你和小微聊到第 10 轮时自动生成。",
-                        "state": snapshot,
-                    })
-                    return
-                if state.get("in_progress"):
-                    self.send_json({
-                        "status": "in_progress",
-                        "message": "画像正在后台自动更新，稍候自动刷新...",
-                        "state": snapshot,
-                        "user_turn_count": turn_count,
-                    })
-                    return
-                if last_done >= turn_count and last_done > 0:
-                    self.send_json({
-                        "status": "up_to_date",
-                        "message": f"画像已是最新（基于前 {last_done} 轮对话，于 {last_updated_at or '上次'} 生成）。",
-                        "state": snapshot,
-                        "user_turn_count": turn_count,
-                    })
-                    return
-                next_auto = ((turn_count // AUTO_PROFILE_INTERVAL) + 1) * AUTO_PROFILE_INTERVAL
-                if last_done <= 0:
-                    msg = f"画像尚未生成，当前已聊 {turn_count} 轮，第 {next_auto} 轮时会自动生成。"
-                else:
-                    msg = (
-                        f"画像基于前 {last_done} 轮对话；当前已聊到第 {turn_count} 轮，"
-                        f"新增对话将在第 {next_auto} 轮时自动并入。"
-                    )
-                self.send_json({
-                    "status": "stale",
-                    "message": msg,
-                    "state": snapshot,
-                    "user_turn_count": turn_count,
-                    "next_auto_turn": next_auto,
-                })
+                self.post_wallet_pending_action()
                 return
             self.send_error(404)
         except EnterpriseRequired as exc:
             self.send_json({"error": str(exc), "needs_enterprise": True}, status=403)
         except AuthError as exc:
             self.send_json({"error": str(exc), "authenticated": False}, status=401)
+        except ValueError as exc:
+            # ValueError 携带的是面向用户的中文提示（手机号格式、上传过大等）。
+            self.send_json({"error": str(exc)}, status=400)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, status=500)
+            self.send_internal_error(exc)
 
-    def handle_chat_stream(self) -> None:
+    INTERNAL_ERROR_MESSAGE = "服务器开小差了，请稍后再试"
+
+    def send_internal_error(self, exc: Exception) -> None:
+        """500: log the real exception server-side, return a generic message.
+
+        Raw exception text can carry internal details (gateway stderr tail,
+        file paths, provider config), none of which belongs in a client
+        response.
+        """
+        self.log_exception(exc)
+        self.send_json({"error": self.INTERNAL_ERROR_MESSAGE}, status=500)
+
+    def log_exception(self, exc: Exception) -> None:
+        print(f"[wewallet] unhandled error on {self.command} {self.path}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
+    # ── GET handlers ─────────────────────────────────────────────────────
+    def get_healthz(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json({"ok": True})
+
+    def get_voicecall_realtime_config(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        # 告诉前端通话语音走哪条路 + 实时中继地址 + 访问令牌（仅发给已登录用户）。
+        # 令牌现在**绑定该用户的 enterprise_id 并带时效**：既防公网盗用，又让中继
+        # 认得出是哪个企业在通话，从而注入与主聊天共享的客户记忆（见 voicecall.mint_call_token）。
+        auth_user = verify_auth_token(self.cookie_value(AUTH_COOKIE_NAME))
+        enterprise_id = str((auth_user or {}).get("enterprise_id") or "")
+        # 必须已登录、已绑企业，才能拿到带记忆的令牌（无企业则没有可共享的记忆）。
+        enabled = bool(enterprise_id) and VOICECALL_VOICE_BACKEND == "realtime" and realtime_voice_ready()
+        self.send_json({
+            "backend": "realtime" if enabled else "placeholder",
+            "enabled": enabled,
+            "relay_port": VOICECALL_RELAY_PORT,
+            # ws_url(完整) > relay_path(同源路径) > 按 host:relay_port 自拼（本地）。
+            "ws_url": VOICECALL_RELAY_PUBLIC_URL,
+            "relay_path": VOICECALL_RELAY_PATH,
+            "token": mint_call_token(enterprise_id) if enabled else "",
+        })
+
+    def get_auth_me(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json(self.auth_payload())
+
+    def get_messages(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json({"messages": load_messages(str(enterprise["id"]))})
+
+    def get_profile(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        profile_path, markdown = load_profile_markdown(enterprise_id)
+        state = load_profile_state(enterprise_id)
+        self.send_json({
+            "path": str(profile_path),
+            "markdown": markdown,
+            "state": {
+                "in_progress": bool(state.get("in_progress")),
+                "last_profile_updated_at": state.get("last_profile_updated_at") or "",
+                "last_profile_trigger": state.get("last_profile_trigger") or "",
+                "last_profile_changed": bool(state.get("last_profile_changed")),
+                "last_error": state.get("last_error") or "",
+            },
+        })
+
+    def get_loan_estimate(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json({"estimate": load_loan_estimate(str(enterprise["id"]))})
+
+    def get_account_profile(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json({"profile": load_account_profile(user, enterprise)})
+
+    def get_wallet(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        transactions = load_wallet_transactions(str(enterprise["id"]))
+        self.send_json({"transactions": transactions, "summary": wallet_summary(transactions)})
+
+    def get_wallet_pending(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json({"pending": load_pending(str(enterprise["id"]))})
+
+    def get_knowledge_status(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json(KNOWLEDGE.status())
+
+    def get_image_knowledge_status(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json(image_kb_for_enterprise(str(enterprise["id"])).status())
+
+    def get_static(self, path: str) -> None:
+        target = (STATIC_DIR / path.removeprefix("/static/")).resolve()
+        try:
+            target.relative_to(STATIC_DIR.resolve())
+        except ValueError:
+            self.send_error(403)
+            return
+        self.send_file(target, self.content_type(target))
+
+    def get_upload(self, path: str) -> None:
         _user, enterprise = self.current_context()
+        enterprise_id = str(enterprise["id"])
+        upload_path = path.removeprefix("/uploads/")
+        if not upload_path.startswith(f"{enterprise_id}/"):
+            self.send_error(403)
+            return
+        target = (enterprise_uploads_dir(enterprise_id) / upload_path.removeprefix(f"{enterprise_id}/")).resolve()
+        try:
+            target.relative_to(enterprise_uploads_dir(enterprise_id).resolve())
+        except ValueError:
+            self.send_error(403)
+            return
+        self.send_file(target, self.content_type(target))
+
+    # ── POST handlers：认证 ───────────────────────────────────────────────
+    def post_auth_sms_send(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        payload = self.read_json()
+        phone = normalize_phone(str(payload.get("phone", "")))
+        code = create_sms_code(phone)
+        if code is None:
+            self.send_json({"error": "验证码发送过于频繁，请稍后再试"}, status=429)
+            return
+        send_sms_code(phone, code)
+        payload = {"ok": True, "expires_in": SMS_CODE_TTL_SECONDS}
+        # 默认关：验证码绝不能进 API 响应，否则任何人都能登录任意手机号。
+        # 本地演示要在页面上直接看到验证码时，显式设 WEWALLET_SMS_DEBUG=1。
+        if is_truthy(os.environ.get("WEWALLET_SMS_DEBUG", "0")):
+            payload["debug_code"] = code
+        self.send_json(payload)
+
+    def post_auth_sms_verify(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        payload = self.read_json()
+        phone = normalize_phone(str(payload.get("phone", "")))
+        code = re.sub(r"\D+", "", str(payload.get("code", "")))
+        if len(code) != 6:
+            self.send_json({"error": "请输入 6 位验证码"}, status=400)
+            return
+        if not consume_sms_code(phone, code):
+            self.send_json({"error": "验证码错误或已过期"}, status=400)
+            return
+        found = find_user_by_phone(phone)
+        if not found:
+            self.send_json({"error": "该手机号未注册，请先注册"}, status=404)
+            return
+        found = mark_user_logged_in(str(found["id"]))
+        token = create_auth_session(str(found["id"]))
+        self.send_json_with_cookie(self.auth_payload_for_user(found), token=token)
+
+    def post_auth_password_login(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        payload = self.read_json()
+        phone = normalize_phone(str(payload.get("phone", "")))
+        password = str(payload.get("password", ""))
+        found = find_user_by_phone(phone)
+        if not found or not verify_password(password, str(found.get("password_hash") or "")):
+            self.send_json({"error": "手机号或密码错误"}, status=400)
+            return
+        found = mark_user_logged_in(str(found["id"]))
+        token = create_auth_session(str(found["id"]))
+        self.send_json_with_cookie(self.auth_payload_for_user(found), token=token)
+
+    def post_auth_register(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        payload = self.read_json()
+        phone = normalize_phone(str(payload.get("phone", "")))
+        password = validate_password(str(payload.get("password", "")))
+        code = re.sub(r"\D+", "", str(payload.get("code", "")))
+        if len(code) != 6:
+            self.send_json({"error": "请输入 6 位验证码"}, status=400)
+            return
+        if not consume_sms_code(phone, code):
+            self.send_json({"error": "验证码错误或已过期"}, status=400)
+            return
+        created = create_user(phone, password)
+        token = create_auth_session(str(created["id"]))
+        self.send_json_with_cookie(self.auth_payload_for_user(created), token=token)
+
+    def post_auth_logout(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        revoke_auth_token(self.cookie_value(AUTH_COOKIE_NAME))
+        self.send_json_with_cookie({"ok": True}, token="")
+
+    # ── POST handlers：聊天 / 通话 ────────────────────────────────────────
+    def post_messages_suggestions(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        messages = load_messages(enterprise_id)
+        suggestions = _ensure_latest_suggestions(enterprise_id, messages, enterprise)
+        self.send_json({"ok": True, "messages": messages, "suggestions": suggestions})
+
+    def post_voicecall(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        # 视频通话模块（通话版小微）。与主聊天共享同一份记忆：按 enterprise_id
+        # 取画像+近期对话当"开场记忆"注入，让通话小微一接通就认得这位客户。
+        enterprise_id = str(enterprise["id"])
+        payload = self.read_json()
+        transcript = str(payload.get("transcript", "")).strip()
+        frame = str(payload.get("frame", "")).strip()  # data:image/...;base64,
+        history = payload.get("history") if isinstance(payload.get("history"), list) else []
+        if not transcript and not frame:
+            self.send_json({"error": "transcript 不能为空"}, status=400)
+            return
+        memory_context = build_call_memory_context(enterprise_id, load_messages(enterprise_id))
+        reply = call_xiaowei(transcript, history, frame, memory_context)
+        self.send_json({"ok": True, "reply": reply})
+
+    def post_voicecall_end(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        # 挂断回流：把这通通话的对话清洗后并入主聊天时间线（channel:voice），
+        # 再触发画像更新——于是通话里说过的事，回到文字聊天小微也"记得"。
+        enterprise_id = str(enterprise["id"])
+        payload = self.read_json()
+        turns = payload.get("transcript") if isinstance(payload.get("transcript"), list) else []
+        normalized, stats = normalize_transcript(turns)
+        voice_messages = []
+        for turn in normalized or []:
+            role = "assistant" if turn.get("role") == "ai" else "user"
+            content = str(turn.get("content") or turn.get("text") or "").strip()
+            if content:
+                voice_messages.append({"role": role, "content": content, "channel": "voice"})
+        auto_profile = None
+        if voice_messages:
+            append_messages(enterprise_id, voice_messages)
+            messages = load_messages(enterprise_id)
+            auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
+        self.send_json({"ok": True, "saved": len(voice_messages), "auto_profile": auto_profile})
+
+    def post_chat(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        user_message, attachments = self.read_chat_submission(enterprise_id)
+        if not user_message and not attachments:
+            self.send_json({"error": "message 不能为空"}, status=400)
+            return
+        self.send_json(run_chat_turn(enterprise_id, enterprise, user_message, attachments))
+
+    def post_chat_stream(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         enterprise_id = str(enterprise["id"])
         user_message, attachments = self.read_chat_submission(enterprise_id)
         if not user_message and not attachments:
             self.send_json({"error": "message 不能为空"}, status=400)
             return
 
-        messages = load_messages(enterprise_id)
-        display_message = display_user_message(user_message, attachments)
-        image_attachments = [item for item in attachments if item.get("kind") == "image"]
-        image_paths = [str(item["path"]) for item in image_attachments]
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -751,114 +771,164 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             emit("assistant.start", {"content": "正在分析客户需求..."})
-
-            asr_events = _asr_progress_events(attachments)
-            for ev in asr_events:
-                emit(ev["type"], {"name": ev.get("name"), "tool_id": ev.get("tool_id"), "preview": ev.get("text")})
-
-            emit("tool.start", {"name": "本地知识库", "tool_id": "local-knowledge"})
-            knowledge_started_at = time.monotonic()
-            try:
-                knowledge_hits = KNOWLEDGE.search(display_message, top_k=KNOWLEDGE_TOP_K)
-            except Exception as exc:
-                emit("tool.complete", {
-                    "name": "本地知识库",
-                    "tool_id": "local-knowledge",
-                    "duration_s": time.monotonic() - knowledge_started_at,
-                    "error": str(exc),
-                })
-                raise
-            knowledge_duration = time.monotonic() - knowledge_started_at
-            emit("tool.progress", {"name": "本地知识库", "preview": summarize_knowledge_hits(knowledge_hits)})
-            emit("tool.complete", {
-                "name": "本地知识库",
-                "tool_id": "local-knowledge",
-                "duration_s": knowledge_duration,
-            })
-            local_progress = asr_events + knowledge_progress_events(knowledge_hits, knowledge_duration)
-
-            image_kb = image_kb_for_enterprise(enterprise_id)
-            emit("tool.start", {"name": "客户历史图档", "tool_id": "image-history"})
-            image_kb_started_at = time.monotonic()
-            try:
-                image_hits = image_kb.search(
-                    text=display_message,
-                    image_paths=image_paths,
-                    top_k=IMAGE_KB_TOP_K,
-                    exclude_paths=image_paths,
-                )
-            except Exception as exc:
-                image_hits = []
-                emit("tool.complete", {
-                    "name": "客户历史图档",
-                    "tool_id": "image-history",
-                    "duration_s": time.monotonic() - image_kb_started_at,
-                    "error": str(exc),
-                })
-            else:
-                image_kb_duration = time.monotonic() - image_kb_started_at
-                emit("tool.progress", {"name": "客户历史图档", "preview": summarize_image_hits(image_hits)})
-                emit("tool.complete", {
-                    "name": "客户历史图档",
-                    "tool_id": "image-history",
-                    "duration_s": image_kb_duration,
-                })
-                local_progress = local_progress + image_kb_progress_events(image_hits, image_kb_duration)
-
-            gateway_delta_count = 0
-
-            def gateway_emit(event_type: str, payload: dict[str, Any]) -> None:
-                nonlocal gateway_delta_count
-                if event_type == "message.delta":
-                    gateway_delta_count += 1
-                emit(event_type, payload)
-
-            result = gateway_for_enterprise(enterprise_id).submit(
-                f"chat:{enterprise_id}",
-                build_gateway_chat_turn(messages, display_message, enterprise, knowledge_hits, image_hits, attachments),
-                image_paths=image_paths,
-                event_callback=gateway_emit,
-            )
-            cleaned_content, upload_request = extract_upload_request(result["content"])
-            if gateway_delta_count == 0 and cleaned_content.strip():
-                _stream_text_chunks(cleaned_content, emit)
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": cleaned_content,
-                "thinking": result["thinking"],
-                "progress": local_progress + result["progress"],
-                "inline_diffs": result["inline_diffs"],
-            }
-            if upload_request:
-                assistant_message["upload_request"] = upload_request
-            suggestions = _generate_suggestions(
-                enterprise_id,
-                messages,
-                display_message,
-                cleaned_content,
-                enterprise,
-            )
-            if suggestions:
-                assistant_message["suggestions"] = suggestions
-            new_messages = [
-                {"role": "user", "content": display_message, "attachments": attachments},
-                assistant_message,
-            ]
-            append_messages(enterprise_id, new_messages)
-            messages.extend(new_messages)
-            if image_attachments:
-                _schedule_image_ingest(enterprise_id, image_attachments)
-            auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
-            emit("message.complete", {
-                "messages": messages,
-                "auto_profile": auto_profile,
-                "wallet_pending": load_pending(enterprise_id),
-            })
-        except Exception as exc:
+            result = run_chat_turn(enterprise_id, enterprise, user_message, attachments, emit=emit)
+            emit("message.complete", result)
+        except ValueError as exc:
             emit("error", {"error": str(exc)})
+        except Exception as exc:
+            self.log_exception(exc)
+            emit("error", {"error": self.INTERNAL_ERROR_MESSAGE})
+
+    def post_reset(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        clear_messages(enterprise_id)
+        gateway_for_enterprise(enterprise_id).reset_session(f"chat:{enterprise_id}")
+        self.send_json({"ok": True})
+
+    # ── POST handlers：账户 / 企业 ────────────────────────────────────────
+    def post_account_profile(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        profile = save_account_profile(user, enterprise, self.read_json())
+        self.send_json({"ok": True, "profile": profile, "auth": self.auth_payload_for_user(user)})
+
+    def post_account_avatar(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        profile = self.save_account_avatar(user, enterprise)
+        self.send_json({"ok": True, "profile": profile, "auth": self.auth_payload_for_user(user)})
+
+    def post_enterprise_create(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        payload = self.read_json()
+        created = create_enterprise_for_user(
+            user,
+            str(payload.get("name", "")),
+            str(payload.get("credit_code", "")),
+        )
+        self.send_json({"ok": True, "enterprise": created, "auth": self.auth_payload()})
+
+    # ── POST handlers：钱包 ───────────────────────────────────────────────
+    def post_wallet_transaction(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        payload = self.read_json()
+        with wallet_lock(enterprise_id):
+            transactions = load_wallet_transactions(enterprise_id)
+            transactions.append(normalize_wallet_transaction(payload))
+            save_wallet_transactions(enterprise_id, transactions)
+        self.send_json({"ok": True, "transactions": transactions, "summary": wallet_summary(transactions)})
+
+    def post_wallet_import(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        with wallet_lock(enterprise_id):
+            transactions = self.import_wallet_csv(enterprise_id)
+        self.send_json({"ok": True, "transactions": transactions, "summary": wallet_summary(transactions)})
+
+    def post_wallet_pending_action(self) -> None:
+        tail = self.path[len("/api/wallet/pending/"):]
+        pending_id, _, action = tail.partition("/")
+        if action not in {"confirm", "reject"} or not pending_id:
+            self.send_json({"error": "无效的 pending 操作路径"}, status=400)
+            return
+        _user, enterprise = self.current_context()
+        enterprise_id = str(enterprise["id"])
+        try:
+            with wallet_lock(enterprise_id):
+                if action == "confirm":
+                    result = apply_pending(enterprise_id, pending_id)
+                else:
+                    result = reject_pending(enterprise_id, pending_id)
+        except KeyError:
+            self.send_json({"error": "该提案已被处理或不存在"}, status=404)
+            return
+        except (ValueError, RuntimeError) as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        transactions = load_wallet_transactions(enterprise_id)
+        self.send_json({
+            "ok": True,
+            "action": action,
+            "result": result,
+            "pending": load_pending(enterprise_id),
+            "transactions": transactions,
+            "summary": wallet_summary(transactions),
+        })
+
+    # ── POST handlers：知识库 / 画像 ──────────────────────────────────────
+    def post_knowledge_reindex(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.send_json(KNOWLEDGE.rebuild())
+
+    def post_image_knowledge_reindex(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        self.send_json(
+            image_kb_for_enterprise(enterprise_id).rebuild_from_uploads(
+                enterprise_uploads_dir(enterprise_id)
+            )
+        )
+
+    def post_loan_estimate(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        estimate = run_loan_estimate(str(enterprise["id"]), enterprise)
+        self.send_json({"estimate": estimate})
+
+    def post_profile_refresh(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        enterprise_id = str(enterprise["id"])
+        messages = load_messages(enterprise_id)
+        turn_count = user_turn_count(messages)
+        state = load_profile_state(enterprise_id)
+        last_done = int(state.get("last_profile_user_turn_count", 0) or 0)
+        last_updated_at = state.get("last_profile_updated_at") or ""
+        snapshot = {
+            "in_progress": bool(state.get("in_progress")),
+            "last_profile_updated_at": last_updated_at,
+            "last_profile_trigger": state.get("last_profile_trigger") or "",
+            "last_profile_changed": bool(state.get("last_profile_changed")),
+            "last_error": state.get("last_error") or "",
+        }
+
+        if turn_count <= 0:
+            self.send_json({
+                "status": "no_messages",
+                "message": "还没有对话内容，画像会在你和小微聊到第 10 轮时自动生成。",
+                "state": snapshot,
+            })
+            return
+        if state.get("in_progress"):
+            self.send_json({
+                "status": "in_progress",
+                "message": "画像正在后台自动更新，稍候自动刷新...",
+                "state": snapshot,
+                "user_turn_count": turn_count,
+            })
+            return
+        if last_done >= turn_count and last_done > 0:
+            self.send_json({
+                "status": "up_to_date",
+                "message": f"画像已是最新（基于前 {last_done} 轮对话，于 {last_updated_at or '上次'} 生成）。",
+                "state": snapshot,
+                "user_turn_count": turn_count,
+            })
+            return
+        next_auto = ((turn_count // AUTO_PROFILE_INTERVAL) + 1) * AUTO_PROFILE_INTERVAL
+        if last_done <= 0:
+            msg = f"画像尚未生成，当前已聊 {turn_count} 轮，第 {next_auto} 轮时会自动生成。"
+        else:
+            msg = (
+                f"画像基于前 {last_done} 轮对话；当前已聊到第 {turn_count} 轮，"
+                f"新增对话将在第 {next_auto} 轮时自动并入。"
+            )
+        self.send_json({
+            "status": "stale",
+            "message": msg,
+            "state": snapshot,
+            "user_turn_count": turn_count,
+            "next_auto_turn": next_auto,
+        })
+
+    # ── 请求体解析 ────────────────────────────────────────────────────────
+    # JSON 请求体上限：最大的合法负载是 /api/voicecall 的 base64 摄像头帧
+    # （JPEG 一帧 base64 后通常 <1MB），4MB 留足余量。multipart 走
+    # MAX_UPLOAD_BYTES，这里只管 JSON——没有上限就是一个内存耗尽入口。
+    MAX_JSON_BYTES = 4 * 1024 * 1024
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or "0")
+        if length > self.MAX_JSON_BYTES:
+            raise ValueError("请求体过大")
         raw = self.rfile.read(length) if length else b"{}"
         return json.loads(raw.decode("utf-8"))
 
@@ -991,6 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
         save_wallet_transactions(enterprise_id, transactions)
         return transactions
 
+    # ── 响应输出 ──────────────────────────────────────────────────────────
     def send_json(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)

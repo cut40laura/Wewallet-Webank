@@ -181,11 +181,12 @@ def _verify_hint(observation: dict[str, Any] | None) -> str:
 class _DoubaoBridge:
     """一条浏览器⇄豆包连接的共享状态。
 
-    suppress_until：静默喂画面那轮的"吞播报"截止时刻（monotonic）。每轮看画面都会以
-    ChatTextQuery 注入画面文字、触发一次回复，但我们不想让她每轮都开口复述画面，于是在这段
-    窗口内吞掉文字/音频，只让豆包把画面（含人物外观、场景、证件）收进上下文。用户一开口（ASR）
-    立即解除，避免吞真实回答。她要"答画面里的东西"（你长什么样/我手里这是什么）时，靠的是
-    **音频轮回复直接用上下文里的画面信息作答**（那条不吞、正常播）——不再特殊拦截，省得把好答案误吞。
+    suppress_until：静默喂画面触发的"吞复述"兜底截止时刻（monotonic）。每轮看画面都会以
+    ChatTextQuery 注入画面文字、触发一次回复，但我们不想让她每轮都开口复述画面，于是吞掉这条
+    复述的文字/音频，只让豆包把画面（含人物外观、场景、证件）收进上下文。**按复述的生命周期吞**：
+    flush 时置位，复述那轮 TTS_ENDED 解除；suppress_until 只是兜底时限（防复述轮丢帧卡死）。
+    用户一开口（ASR）也立即解除，避免吞真实回答。她要"答画面里的东西"（你长什么样/我手里这是
+    什么）时，靠的是**音频轮回复直接用上下文里的画面信息作答**（那条不吞、正常播）。
     """
 
     def __init__(self, browser: Any, upstream: Any, session_id: str, enterprise_id: str = "") -> None:
@@ -214,10 +215,12 @@ class _DoubaoBridge:
         self.discard_old_turn = False
 
 
-_SUPPRESS_SECONDS = 3.0  # 吞画面播报的安全上限：够吞掉那条即时的画面复述即可。
-# 原为 8.0，但这是个"不分青红皂白"的静音窗——窗口内小微对用户的真实回复也会被一起吞掉，
-# 而看画面每 ~9-12s 触发一次、仅在用户开口(ASR)时才提前解除，用户安静时整段被吞→"突然不说话"。
-# 缩到 3s 大幅减少误伤；更精确的"按那条复述结束再解除"留作后续。
+# 吞画面复述的【兜底】时限：正常解除靠"复述那轮 TTS_ENDED"（生命周期吞），这个时限只防
+# 复述轮丢帧/没出 TTS 时卡死。历史教训：之前是写死 3s 的时间窗，盖不满偏长的复述（LLM ~1s
+# 后才开始出 TTS，整条流完常要 4~8s），3s 后泄漏的后半段紧跟在真实回复尾音后播出——掐了头
+# 的半截画面描述、语气突变平铺（"回复结尾语音冲突/语气突变"的根因）。现在窗口敢放宽到 20s，
+# 是因为 flush 只在真空闲时发（见 awaiting_reply），窗口内不会再有真实回复可误吞。
+_SUPPRESS_FALLBACK_S = 20.0
 # 静态场景也定期刷新画面事实：即便事实没变，超过这个间隔也重注一次，避免"无人/人数"被
 # 对话截断挤出小微的活跃上下文，导致用户口头注水时她手里没有反驳依据。
 _VISION_REFRESH_S = 12.0
@@ -226,9 +229,9 @@ _VISION_REFRESH_S = 12.0
 async def _flush_pending_vision(bridge: _DoubaoBridge) -> None:
     """空闲时把待注入的画面文字发给豆包（静默：吞掉它触发的复述）。
 
-    为什么要"等空闲"：注入画面是以 ChatTextQuery 触发一次（被吞掉的）回复，靠 suppress_until
-    时间窗吞播报。若在她正回答用户时注入，这个吞窗口会盖到她**真实回答**上、把后半句也吞掉。
-    所以只在 `不在播报 且 用户没在说` 时才发；不空闲就攒着，等她说完/用户说完再 flush。
+    为什么要"等空闲"：注入画面是以 ChatTextQuery 触发一次（被吞掉的）回复，吞到这条复述的
+    TTS_ENDED 为止。若在她正回答用户时注入，吞的就会是她的**真实回答**。
+    所以只在 `不在播报 且 用户没在说 且 不在等回复` 时才发；不空闲就攒着，空闲了再 flush。
 
     画面（含人物外观/场景/证件）就这样静默进上下文；用户问"你长什么样""我手里这是什么"时，
     她的**音频轮回复直接用上下文作答**（那条不在吞窗内、正常播），无需对画面注入特殊放行。
@@ -239,8 +242,9 @@ async def _flush_pending_vision(bridge: _DoubaoBridge) -> None:
         return  # 不空闲（在播 / 用户在说 / 等回复间隙），先攒着
     content = bridge.pending_vision
     bridge.pending_vision = None
-    bridge.suppress_until = time.monotonic() + _SUPPRESS_SECONDS  # 吞掉这条触发的复述
-    _dbg(f"FLUSH 注入画面+设 suppress {_SUPPRESS_SECONDS}s | content={content[:60]!r}")
+    # 吞掉这条触发的复述：到它的 TTS_ENDED 为止（生命周期吞），时限只是丢帧兜底。
+    bridge.suppress_until = time.monotonic() + _SUPPRESS_FALLBACK_S
+    _dbg(f"FLUSH 注入画面+设 suppress（至复述 TTS_ENDED，兜底 {_SUPPRESS_FALLBACK_S}s）| content={content[:60]!r}")
     await bridge.upstream.send(
         dbq.make_full_client_frame(dbq.EVENT_CHAT_TEXT_QUERY, {"content": content}, bridge.session_id))
 
@@ -326,7 +330,8 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
             ):
                 continue
             await bridge.browser.send(json.dumps(payload))
-        # 只在 TTS 真正播完时解除：ChatEnded 早于音频，用它解除会让喂画面那轮的音频漏出来
+        # 【主解除点】复述那轮的 TTS_ENDED：生命周期吞到这里结束（上面的 20s 时限只是丢帧兜底）。
+        # 不能用 ChatEnded——它早于音频，用它解除会让复述的音频漏出来。
         if suppressing and frame.event == dbq.EVENT_TTS_ENDED:
             bridge.suppress_until = 0.0
 

@@ -1,0 +1,8 @@
+# 微众钱包 Web UI 运行时依赖（ui/ 下的服务端）。
+# 安装：python3 -m pip install -r requirements.txt
+# 注意：本机日常用 anaconda 的 python（/opt/anaconda3/bin/python3）跑，
+# 系统自带 python3 没有这些包。Hermes 智能体本体的依赖见
+# deploy/hermes-agent-requirements.txt。
+requests>=2.31
+numpy>=1.26
+websockets>=12.0
