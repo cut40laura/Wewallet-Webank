@@ -579,6 +579,7 @@ function renderMessages() {
   for (const message of state.messages) {
     const node = messageTemplate.content.firstElementChild.cloneNode(true);
     node.dataset.role = message.role;
+    if (message.role === "assistant" && message.streaming) node.classList.add("is-streaming");
     const attachments = Array.isArray(message.attachments) ? message.attachments : [];
     if (attachments.length) node.classList.add("has-media");
     node.querySelector(".message-role").textContent = message.role === "user" ? "我" : "小微";
