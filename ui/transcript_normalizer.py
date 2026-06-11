@@ -11,6 +11,14 @@ _SPACE_RE = re.compile(r"\s+")
 _SENTENCE_RE = re.compile(r"([^。！？]+)([。！？]?)")
 
 
+_PUNCT_RE = re.compile(r"[\s，。！？、,.!?；;：:～~]+")
+
+
+def _compare_key(text: str) -> str:
+    """跨条比较用：去掉空白和标点，只比内容，免得标点差异（如有无问号）挡住前缀判断。"""
+    return _PUNCT_RE.sub("", str(text or ""))
+
+
 def _collapse_char_runs(text: str) -> str:
     # ASR stutters often arrive as "你你你" or "对对对"; keep one.
     return _CJK_RUN_RE.sub(r"\1", text)
@@ -89,13 +97,6 @@ def _restore_leading_polarity(original: str, cleaned: str) -> str:
     return cleaned
 
 
-def _restore_leading_pause(text: str) -> str:
-    for prefix in ("不是", "没有", "对呀", "对啊", "是的"):
-        if text.startswith(prefix) and len(text) > len(prefix) and text[len(prefix)] != "，":
-            return f"{prefix}，{text[len(prefix):]}"
-    return text
-
-
 def normalize_call_text(text: Any) -> str:
     """Normalize one transcript string while preserving the intended meaning."""
     raw = str(text or "").strip()
@@ -112,7 +113,7 @@ def normalize_call_text(text: Any) -> str:
         punct = match.group(2)
         if not body:
             continue
-        cleaned = _SPACE_RE.sub("", body.replace("，", "").replace(",", ""))
+        cleaned = _SPACE_RE.sub("", body)
         for _ in range(4):
             prev = cleaned
             cleaned = _collapse_char_runs(cleaned)
@@ -121,22 +122,14 @@ def normalize_call_text(text: Any) -> str:
             cleaned = _collapse_adjacent_repeats(cleaned)
             if cleaned == prev:
                 break
-        cleaned = _restore_leading_pause(_restore_leading_polarity(body, cleaned)).strip(" ，,")
+        cleaned = _restore_leading_polarity(body, cleaned).strip(" ，,")
         if cleaned:
             parts.append(f"{cleaned}{punct}")
 
     out: list[str] = []
     keys: list[str] = []
     for part in parts:
-        key = re.sub(r"[。！？]$", "", part).replace("，", "")
-        while keys and key and keys[-1] and keys[-1] in key and keys[-1] != key:
-            keys.pop()
-            out.pop()
-        if len(keys) >= 2 and f"{keys[-2]}{keys[-1]}" in key:
-            keys.pop()
-            out.pop()
-            keys.pop()
-            out.pop()
+        key = re.sub(r"[。！？]$", "", part)
         if keys and keys[-1] == key:
             continue
         out.append(part)
@@ -158,8 +151,6 @@ def normalize_transcript(transcript: Any) -> tuple[Any, dict[str, Any]]:
         if role not in {"user", "ai"}:
             role = "user" if role == "客户" else "ai" if role in {"assistant", "bot"} else role
         text = normalize_call_text(item.get("text"))
-        if role == "ai":
-            text = str(item.get("text") or "").strip()
         if not role or not text:
             continue
         raw_text = str(item.get("text") or "")
@@ -171,10 +162,21 @@ def normalize_transcript(transcript: Any) -> tuple[Any, dict[str, Any]]:
             entry["ts"] = float(item["ts"])
         normalized.append(entry)
 
+    # 跨条折叠 ASR 前缀累积：实时 ASR 会把一句话拆成"怎么样"→"怎么样我"→…→"我在火锅店"
+    # 一串逐渐变长的独立条目，单条清洗管不了跨条的这种。同角色相邻、且一条是另一条的前缀时，
+    # 只留最长的那条；完全相同的也去重。否则会让同一句声称在 tail 里被放大很多倍。
     compacted: list[dict[str, Any]] = []
     for entry in normalized:
-        if compacted and compacted[-1]["role"] == entry["role"] and compacted[-1]["text"] == entry["text"]:
-            continue
+        if compacted and compacted[-1]["role"] == entry["role"]:
+            prev_key = _compare_key(compacted[-1]["text"])
+            cur_key = _compare_key(entry["text"])
+            if prev_key == cur_key:
+                continue  # 清洗后完全相同 → 去重
+            if cur_key.startswith(prev_key):
+                compacted[-1] = entry  # 当前是上一条的延伸（前缀累积）→ 用更长的替换
+                continue
+            if prev_key.startswith(cur_key):
+                continue  # 上一条更长、当前是它的前缀 → 丢当前
         compacted.append(entry)
     return compacted, {
         "changed": compacted != transcript,
@@ -205,7 +207,6 @@ def normalize_observations(observations: Any) -> tuple[Any, dict[str, Any]]:
         "place_type",
         "person_present",
         "person_count",
-        "person_description",
         "looking_off_screen",
         "visible_documents",
         "document_text",

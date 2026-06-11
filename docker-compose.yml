@@ -1,11 +1,10 @@
-version: "2.4"
-
 services:
   app:
     build: .
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       CUSTOMER_MANAGER_UI_HOST: 0.0.0.0
       CUSTOMER_MANAGER_UI_PORT: 8787
@@ -16,6 +15,12 @@ services:
       HERMES_AGENT_DIR: /opt/hermes-agent
       WEWALLET_COOKIE_SECURE: "${WEWALLET_COOKIE_SECURE:-0}"
       WEWALLET_SMS_DEBUG: "0"
+      # 端到端实时语音：中继须监听 0.0.0.0，nginx 容器才能经 app:8789 连到；
+      # 前端走同源路径 /voicecall-relay（nginx 反代），https 页面自动升级为 wss。
+      # 还需在 .env 里放 STEP_API_KEY 并设 WEWALLET_VOICECALL_PROVIDER=stepfun。
+      WEWALLET_VOICECALL_VOICE_BACKEND: "realtime"
+      WEWALLET_VOICECALL_RELAY_HOST: "0.0.0.0"
+      WEWALLET_VOICECALL_RELAY_PATH: "/voicecall-relay"
     volumes:
       - ./runtime/app_data:/data/app_data
       - ./runtime/ui_data:/data/ui_data
@@ -27,37 +32,15 @@ services:
       timeout: 5s
       retries: 3
 
-  # 实时通话代理（语音/视频通话的 WS + 视觉/风控 HTTP）。
-  # 只在 docker 内网监听 8870，由 Caddy 经 /rtc 反代过来（TLS 由 Caddy 终止），不对外开端口、不需要证书。
-  realtime:
-    build: ./realtime
-    restart: unless-stopped
-    env_file:
-      - .env
-    # TLS 由 Caddy 在边缘终止，容器内始终 http/ws，无需证书。
-    environment:
-      DOUBAO_REALTIME_PROXY_HOST: 0.0.0.0
-      DOUBAO_REALTIME_PROXY_PORT: "8870"
-    expose:
-      - "8870"
-
-  # 边缘反向代理：自动申请/续期 Let's Encrypt 受信任证书（绿锁，无警告），
-  # 把 / 反代到 app、/rtc 反代到实时代理。80 用于 ACME 验证 + 跳转 443。
-  caddy:
-    image: caddy:2-alpine
+  nginx:
+    image: nginx:1.27-alpine
     restart: unless-stopped
     depends_on:
       app:
         condition: service_healthy
-      realtime:
-        condition: service_started
-    environment:
-      # 解析到本机 IP 的域名。默认用免费 sslip.io（无需购买）；有自己的域名就在 .env 覆盖。
-      WEWALLET_SITE_DOMAIN: "${WEWALLET_SITE_DOMAIN:-115-159-127-218.sslip.io}"
     ports:
       - "80:80"
-      - "443:443"
+      - "443:443"   # HTTPS：放证书 + 取消 wewallet.conf 里 443 段注释后生效
     volumes:
-      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./runtime/caddy_data:/data
-      - ./runtime/caddy_config:/config
+      - ./deploy/nginx/wewallet.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro   # fullchain.pem + privkey.pem

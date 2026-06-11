@@ -1,19 +1,5 @@
 .DS_Store
 **/.DS_Store
-.venv/
-.pytest_cache/
-node_modules/
-*.log
-*.db
-*.db-*
-*.sqlite
-*.sqlite3
-*.pem
-*.p12
-*.crt
-*.key
-*.secret
-.auth_secret
 .hermes-customer-manager/config.yaml
 .hermes-customer-manager/.env
 .hermes-customer-manager/auth.json
@@ -39,9 +25,6 @@ app_data/
 runtime/
 .env
 
-# TLS 证书/私钥（在服务器上生成，绝不提交）
-deploy/certs/
-
 # 模拟器产物（保留代码与画像，忽略运行输出）
 simulator/logs/
 simulator/memory/
@@ -57,11 +40,12 @@ __pycache__/
 customer-risk-profile.md
 风控经理测试档案.md
 基于hermes的客户经理智能体100轮对话测试.md
-execute_100_round_test.py
-run_100_round_test.py
+scripts/execute_100_round_test.py
+scripts/run_100_round_test.py
 run-customer-manager.sh
 output/
 
-# 实时通话 sidecar
-realtime/node_modules/
-realtime/.env
+# TLS 证书（私钥，勿提交）
+deploy/certs/*.pem
+deploy/certs/*.crt
+deploy/certs/*.key

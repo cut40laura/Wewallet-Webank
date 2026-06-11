@@ -1,4 +1,4 @@
-"""Unit tests for the video-call persistence layer.
+"""Unit tests for video-call due-diligence records (video_calls.py).
 
 Run from the project root:
     python3 -m unittest tests.test_video_calls -v
@@ -12,203 +12,172 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-_TEST_TMP = tempfile.mkdtemp(prefix="wewallet-vc-test-")
-
-os.environ["WEWALLET_UI_DATA_DIR"] = os.path.join(_TEST_TMP, "ui-data")
-os.environ["WEWALLET_DB"] = os.path.join(_TEST_TMP, "ui-data", "wewallet.sqlite")
-os.environ["WEWALLET_AUTH_SECRET"] = "test-secret-for-unittest"
+os.environ["WEWALLET_AUTH_SECRET"] = "test-secret"
+# Point the SQLite database at a throwaway file so tests never touch real data.
+_DB_DIR = tempfile.mkdtemp(prefix="wewallet-test-vc-")
+os.environ["WEWALLET_DB"] = str(Path(_DB_DIR) / "test.sqlite")
 
 sys.path.insert(0, str(REPO_ROOT / "ui"))
 
+import db  # noqa: E402
 import video_calls  # noqa: E402
 
-ENT_A = "ent-aaa"
-ENT_B = "ent-bbb"
+ENT_A = "ent_aaaaaaaaaaaa"
+ENT_B = "ent_bbbbbbbbbbbb"
+
+TRANSCRIPT = [
+    {"role": "user", "content": "我开火锅店的", "channel": "voice"},
+    {"role": "assistant", "content": "生意咋样呀？", "channel": "voice"},
+]
+OBSERVATIONS = [
+    {"caption": "画面里是卧室", "place_type": "卧室", "person_present": True,
+     "looking_off_screen": False, "anomalies": ["口述店面与画面不符"], "ts": "2026-06-10T12:00:00"},
+]
 
 
-class VideoCallPersistenceTest(unittest.TestCase):
-    def test_start_complete_load_roundtrip(self) -> None:
-        call_id = video_calls.start_call(ENT_A, "user-1")
-        self.assertTrue(call_id)
+class RecordRoundtripTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        with db.transaction() as conn:
+            conn.execute("DELETE FROM video_calls")
 
-        active = video_calls.load_call(call_id, ENT_A)
-        self.assertIsNotNone(active)
-        self.assertEqual(active["status"], "active")
-        self.assertIsNone(active["ended_at"])
-        self.assertEqual(active["user_id"], "user-1")
-
-        transcript = [
-            {"role": "user", "text": "你好", "ts": 1.0},
-            {"role": "ai", "text": "您好，在的", "ts": 2.0},
-        ]
-        observations = [{"caption": "店铺内", "place_type": "店铺", "ts": 1.5}]
-        risk = {"level": "low", "reasons": ["画面与口述一致"], "signals": {"anomaly_count": 0}}
-        metadata = {"duration_sec": 42, "channel": "voice", "models": {"vision": "doubao-seed"}}
-
-        video_calls.complete_call(
-            call_id,
-            ENT_A,
-            transcript=transcript,
-            observations=observations,
-            risk=risk,
-            metadata=metadata,
+    def test_record_then_load_roundtrip(self) -> None:
+        call_id = video_calls.record_call(
+            ENT_A, "user-1",
+            transcript=TRANSCRIPT, observations=OBSERVATIONS,
+            metadata={"duration_sec": 65, "started_at": "2026-06-10T11:59:00"},
         )
+        loaded = video_calls.load_call(call_id, ENT_A)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["transcript"], TRANSCRIPT)
+        self.assertEqual(loaded["observations"], OBSERVATIONS)
+        self.assertIsNone(loaded["risk"])  # 后台线程补写前为空
+        self.assertEqual(loaded["metadata"]["duration_sec"], 65)
+        self.assertEqual(loaded["started_at"], "2026-06-10T11:59:00")
+        self.assertTrue(loaded["ended_at"])
 
-        done = video_calls.load_call(call_id, ENT_A)
-        self.assertEqual(done["status"], "completed")
-        self.assertIsNotNone(done["ended_at"])
-        self.assertEqual(done["transcript"], transcript)
-        self.assertEqual(done["observations"], observations)
-        self.assertEqual(done["risk"], risk)
-        self.assertEqual(done["metadata"], metadata)
-
-    def test_enterprise_isolation_on_read(self) -> None:
-        call_id = video_calls.start_call(ENT_A, "user-1")
-        # Another enterprise must not see this call.
+    def test_enterprise_isolation(self) -> None:
+        call_id = video_calls.record_call(
+            ENT_A, None, transcript=TRANSCRIPT, observations=None, metadata=None)
+        # B 企业读不到、补写不动 A 企业的通话。
         self.assertIsNone(video_calls.load_call(call_id, ENT_B))
+        self.assertFalse(video_calls.set_call_risk(call_id, ENT_B, {"level": "high"}))
+        self.assertEqual(video_calls.list_calls(ENT_B), [])
+        # A 企业自己一切正常。
+        self.assertIsNotNone(video_calls.load_call(call_id, ENT_A))
 
-    def test_enterprise_isolation_on_complete(self) -> None:
-        call_id = video_calls.start_call(ENT_A, "user-1")
-        # Completing under the wrong enterprise must not touch the row.
-        updated = video_calls.complete_call(
-            call_id, ENT_B, transcript=[], observations=[], risk=None, metadata={}
-        )
-        self.assertFalse(updated)
-        still_active = video_calls.load_call(call_id, ENT_A)
-        self.assertEqual(still_active["status"], "active")
+    def test_set_call_risk_overwrites(self) -> None:
+        call_id = video_calls.record_call(
+            ENT_A, None, transcript=TRANSCRIPT, observations=None, metadata=None)
+        self.assertTrue(video_calls.set_call_risk(call_id, ENT_A, {"level": "low", "reasons": []}))
+        self.assertTrue(video_calls.set_call_risk(
+            call_id, ENT_A, {"level": "medium", "reasons": ["前后说法矛盾"]}))
+        loaded = video_calls.load_call(call_id, ENT_A)
+        self.assertEqual(loaded["risk"]["level"], "medium")
 
-    def test_list_calls_scoped_and_ordered(self) -> None:
-        a1 = video_calls.start_call(ENT_A, "u")
-        a2 = video_calls.start_call(ENT_A, "u")
-        video_calls.start_call(ENT_B, "u")
+    def test_list_calls_descending(self) -> None:
+        first = video_calls.record_call(ENT_A, None, transcript=TRANSCRIPT, observations=None, metadata=None)
+        second = video_calls.record_call(ENT_A, None, transcript=TRANSCRIPT, observations=None, metadata=None)
+        ids = [c["id"] for c in video_calls.list_calls(ENT_A)]
+        self.assertEqual(ids, [second, first])
 
-        listed = video_calls.list_calls(ENT_A)
-        ids = [row["id"] for row in listed]
-        # Only enterprise A's calls, newest first.
-        self.assertIn(a1, ids)
-        self.assertIn(a2, ids)
-        self.assertTrue(all(row["enterprise_id"] == ENT_A for row in listed))
-        self.assertEqual(ids[0], a2)
 
-    def test_complete_is_idempotent_overwrite(self) -> None:
-        call_id = video_calls.start_call(ENT_A, "user-1")
-        video_calls.complete_call(
-            call_id, ENT_A, transcript=[{"role": "user", "text": "一", "ts": 1}],
-            observations=[], risk=None, metadata={},
-        )
-        video_calls.complete_call(
-            call_id, ENT_A, transcript=[{"role": "user", "text": "二", "ts": 2}],
-            observations=[], risk={"level": "medium"}, metadata={"duration_sec": 9},
-        )
-        done = video_calls.load_call(call_id, ENT_A)
-        self.assertEqual(done["transcript"], [{"role": "user", "text": "二", "ts": 2}])
-        self.assertEqual(done["risk"], {"level": "medium"})
+class ObservationRegistryTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        video_calls.drain_observations(ENT_A)
+        video_calls.drain_observations(ENT_B)
 
-    def test_complete_normalizes_realtime_asr_repetition(self) -> None:
-        call_id = video_calls.start_call(ENT_A, "user-1")
-        noisy = (
-            "对对对呀对呀对呀你对呀你对呀你看对呀你看对呀你看我"
-            "对呀你看我对呀你看我现在对呀你看我现在对呀你看我现在"
-            "对呀你看我现在在对呀你看我现在在店里对呀你看我现在在店里吗"
-            "对呀，你看我现在在店里吗？对呀你看我现在在店里吗对呀，"
-            "你看我现在在店里吗？对呀，你看我现在在店里呢。对呀，你看我现在在店里呢。"
-        )
-        observations = [
-            {
-                "place_type": "居住/宿舍",
-                "person_present": True,
-                "person_description": "戴眼镜，穿深色上衣，手托脸看向镜头",
-                "notable_objects": ["上下铺床", "上下铺床", ""],
-                "visible_documents": [],
-                "caption": " 一名男子处于宿舍内 ",
-                "image": "should-not-survive",
-                "ts": "1780989380.928",
-            },
-            "bad-observation",
-        ]
+    def test_note_then_drain(self) -> None:
+        video_calls.note_observation(ENT_A, {"caption": "第一帧"})
+        video_calls.note_observation(ENT_A, {"caption": "第二帧"})
+        video_calls.note_observation(ENT_B, {"caption": "别家的帧"})
+        drained = video_calls.drain_observations(ENT_A)
+        self.assertEqual([o["caption"] for o in drained], ["第一帧", "第二帧"])
+        self.assertTrue(all(o.get("ts") for o in drained))  # 落痕带时间戳
+        self.assertNotIn("_mono", drained[0])  # 内部字段不外漏
+        # drain 即清空；B 企业的不受影响。
+        self.assertEqual(video_calls.drain_observations(ENT_A), [])
+        self.assertEqual(len(video_calls.drain_observations(ENT_B)), 1)
 
-        video_calls.complete_call(
-            call_id,
-            ENT_A,
-            transcript=[{"role": "user", "text": noisy, "ts": 1}],
-            observations=observations,
-            risk=None,
-            metadata={"duration_sec": 10},
-        )
+    def test_note_ignores_garbage(self) -> None:
+        video_calls.note_observation("", {"caption": "无企业"})
+        video_calls.note_observation(ENT_A, None)
+        video_calls.note_observation(ENT_A, "not-a-dict")
+        self.assertEqual(video_calls.drain_observations(ENT_A), [])
 
-        done = video_calls.load_call(call_id, ENT_A)
-        self.assertEqual(
-            done["transcript"],
-            [{"role": "user", "text": "对呀，你看我现在在店里吗？对呀，你看我现在在店里呢。", "ts": 1.0}],
-        )
-        self.assertEqual(
-            done["observations"],
-            [
-                {
-                    "place_type": "居住/宿舍",
-                    "person_present": True,
-                    "person_description": "戴眼镜，穿深色上衣，手托脸看向镜头",
-                    "notable_objects": ["上下铺床"],
-                    "caption": "一名男子处于宿舍内",
-                    "ts": 1780989380.928,
-                }
-            ],
-        )
-        self.assertTrue(done["metadata"]["normalization"]["transcript"]["changed"])
-        self.assertGreater(done["metadata"]["normalization"]["transcript"]["chars_removed"], 0)
+    def test_buffer_capped(self) -> None:
+        for i in range(video_calls._OBS_MAX_PER_ENTERPRISE + 10):
+            video_calls.note_observation(ENT_A, {"caption": f"帧{i}"})
+        drained = video_calls.drain_observations(ENT_A)
+        self.assertEqual(len(drained), video_calls._OBS_MAX_PER_ENTERPRISE)
+        self.assertEqual(drained[-1]["caption"], f"帧{video_calls._OBS_MAX_PER_ENTERPRISE + 9}")
 
-    def test_complete_normalizes_latest_video_call_samples(self) -> None:
-        call_id = video_calls.start_call(ENT_A, "user-1")
-        transcript = [
-            {
-                "role": "user",
-                "text": (
-                    "我我我我现在我现在我现在我现在在我现在在我现在在飞机"
-                    "我现在在飞机上我现在在飞机上呢我现在在飞机上呢。我现在在飞机上呢"
-                    "有点我现在在飞机上呢有点听不到我现在在飞机上呢，有点听不到。"
-                    "我现在在飞机上呢有点听不到我现在在飞机上呢，有点听不到。"
-                    "我现在在飞机上呢，有点听不到。"
-                ),
-                "ts": 1,
-            },
-            {
-                "role": "user",
-                "text": (
-                    "嗯嗯嗯嗯对嗯对嗯对口嗯对口误嗯对口误了对，口误了。"
-                    "嗯对口误了嗯对口误了嗯，对口误了。嗯，对口误了。"
-                ),
-                "ts": 2,
-            },
-            {
-                "role": "user",
-                "text": (
-                    "你你你为什么你为什么觉得你为什么觉得我在宿舍"
-                    "你为什么觉得我在宿舍不觉得我在公务舱呢"
-                    "你为什么觉得我在宿舍，不觉得我在公务舱呢？"
-                    "你为什么觉得我在宿舍，不觉得我在公务舱呢？"
-                ),
-                "ts": 3,
-            },
-        ]
 
-        video_calls.complete_call(
-            call_id,
-            ENT_A,
-            transcript=transcript,
-            observations=[],
-            risk=None,
-            metadata={"duration_sec": 12},
-        )
+class RiskRulesTestCase(unittest.TestCase):
+    def test_aggregate_signals(self) -> None:
+        signals = video_calls.aggregate_risk_signals([
+            {"anomalies": ["矛盾A", "矛盾B"], "looking_off_screen": True,
+             "person_present": False, "visible_documents": ["营业执照"]},
+            {"anomalies": [], "looking_off_screen": False,
+             "person_present": True, "visible_documents": ["营业执照", "流水单"]},
+            "garbage",
+        ])
+        self.assertEqual(signals["frame_count"], 3)
+        self.assertEqual(signals["anomaly_count"], 2)
+        self.assertEqual(signals["off_screen_count"], 1)
+        self.assertEqual(signals["person_absent_count"], 1)
+        self.assertEqual(signals["documents_seen"], ["营业执照", "流水单"])
 
-        done = video_calls.load_call(call_id, ENT_A)
-        self.assertEqual(
-            [item["text"] for item in done["transcript"]],
-            [
-                "我现在在飞机上呢有点听不到。",
-                "嗯对口误了。",
-                "你为什么觉得我在宿舍不觉得我在公务舱呢？",
-            ],
-        )
+    def test_rule_level(self) -> None:
+        self.assertEqual(video_calls.rule_level({"anomaly_count": 1, "frame_count": 1}), "medium")
+        self.assertEqual(video_calls.rule_level(
+            {"anomaly_count": 0, "frame_count": 4, "off_screen_count": 3}), "medium")
+        self.assertEqual(video_calls.rule_level(
+            {"anomaly_count": 0, "frame_count": 4, "off_screen_count": 1}), "low")
+        self.assertEqual(video_calls.rule_level({"anomaly_count": 0, "frame_count": 0}), "low")
+
+    def test_build_risk_summary_rules_only(self) -> None:
+        # 无转写 → 不走 LLM，纯规则结论（不发网络请求）。
+        risk = video_calls.build_risk_summary(None, OBSERVATIONS)
+        self.assertEqual(risk["level"], "medium")
+        self.assertEqual(risk["reasons"], [])
+        self.assertEqual(risk["signals"]["anomaly_count"], 1)
+
+    def test_contradictions_bump_level(self) -> None:
+        # 实时矛盾是强信号：即便画面干净，也至少抬到 medium，并计入 signals。
+        contradictions = [{"field": "月流水", "stated": "十万", "known": "三十万"}]
+        risk = video_calls.build_risk_summary(None, None, contradictions)
+        self.assertEqual(risk["level"], "medium")
+        self.assertEqual(risk["signals"]["contradiction_count"], 1)
+
+
+class ContradictionRegistryTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        video_calls.drain_contradictions(ENT_A)
+        video_calls.drain_contradictions(ENT_B)
+
+    def test_note_then_drain_isolated(self) -> None:
+        video_calls.note_contradiction(ENT_A, {"field": "店名", "stated": "川香居", "known": "蜀味轩"})
+        video_calls.note_contradiction(ENT_B, {"field": "别家", "stated": "x", "known": "y"})
+        drained = video_calls.drain_contradictions(ENT_A)
+        self.assertEqual(len(drained), 1)
+        self.assertEqual(drained[0]["field"], "店名")
+        self.assertTrue(drained[0]["ts"])
+        self.assertNotIn("_mono", drained[0])
+        self.assertEqual(video_calls.drain_contradictions(ENT_A), [])  # drain 即清空
+        self.assertEqual(len(video_calls.drain_contradictions(ENT_B)), 1)
+
+    def test_note_ignores_garbage(self) -> None:
+        video_calls.note_contradiction("", {"field": "x"})
+        video_calls.note_contradiction(ENT_A, None)
+        self.assertEqual(video_calls.drain_contradictions(ENT_A), [])
+
+
+class CheckContradictionsGuardTestCase(unittest.TestCase):
+    def test_empty_inputs_short_circuit(self) -> None:
+        # 没档案或没口述 → 直接 []，不发网络请求。
+        import voicecall
+        self.assertEqual(voicecall.check_contradictions("", "我月流水十万"), [])
+        self.assertEqual(voicecall.check_contradictions("档案：月流水三十万", ""), [])
 
 
 if __name__ == "__main__":

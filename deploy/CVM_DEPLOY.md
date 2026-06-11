@@ -1,6 +1,6 @@
 # CVM 部署说明
 
-目标方案：CVM 4C8G、Docker Compose、Caddy（自动 HTTPS）、文件数据卷。
+目标方案：CVM 4C8G、Docker Compose、Nginx、文件数据卷。
 
 ## 1. 服务器准备
 
@@ -61,47 +61,6 @@ runtime/hermes-agent
 - `HERMES_HOME=/opt/wewallet/hermes-home`
 - `HERMES_AGENT_DIR=/opt/hermes-agent`
 
-## 4.5 语音/视频通话（Caddy 自动 HTTPS，无需自签证书）
-
-通话能在本地用、在服务器用不了，是两个硬限制造成的，已用 Caddy 一并解决：
-
-1. **页面必须 HTTPS**：浏览器只在安全上下文（HTTPS 或 localhost）允许 `getUserMedia` 取摄像头/麦克风。纯 IP 的 HTTP 页面一开通话就报"无法获取麦克风/摄像头"。
-2. **实时代理必须可达且是 wss**：HTTPS 页面不能连 `ws://`（mixed-content）。
-
-方案：Caddy 在边缘自动申请 **Let's Encrypt 受信任证书**（绿锁、无警告、自动续期），并把 `/` 反代到 app、`/rtc` 反代到内网实时代理。**不用自签证书、不用单独开 8870 端口、不用手动信任。**
-
-### (1) 域名与备案
-
-腾讯云大陆服务器上，未备案域名的 80/443 会被拦截，证书签不下来。**必须用已备案、且 A 记录解析到本机 IP 的自有域名。**
-在 `.env` 设 `WEWALLET_SITE_DOMAIN=你的备案域名`。
-
-> Let's Encrypt 签发需要 **80 端口能从公网访问**（你已开放 80/443，无需再开 8870）。
-
-### (2) 配置 `.env` 里的通话凭证
-
-```bash
-# 豆包实时语音（二选一）
-DOUBAO_REALTIME_APP_ID=...
-DOUBAO_REALTIME_ACCESS_KEY=...
-# 或 DOUBAO_REALTIME_API_KEY=...
-
-# 视觉/风控/矛盾检测（火山方舟）
-ARK_API_KEY=...
-
-# 已备案、解析到本机 IP 的域名
-WEWALLET_SITE_DOMAIN=你的备案域名
-```
-
-不配豆包/ARK 凭证，通话代理只会进 mock，不是真通话。
-
-### (3) 访问
-
-```text
-https://你的备案域名/chat
-```
-
-首次启动 Caddy 会自动签证书（约几十秒），之后绿锁、无警告，**网址可直接分享给别人，点开即用**。
-
 ## 5. 启动
 
 ```bash
@@ -113,17 +72,50 @@ docker compose up -d --build
 ```bash
 docker compose ps
 docker compose logs -f app
-docker compose logs -f caddy      # 看证书签发是否成功
-docker compose logs -f realtime   # 看通话代理是否就绪
 ```
 
 访问：
 
 ```text
-https://你的备案域名/chat
+http://服务器公网 IP/chat
 ```
 
-> 80 会自动跳转到 443；首次启动需等 Caddy 签发证书（几十秒）。证书签不下来通常是域名未备案或 80 端口不通。
+绑定域名和 HTTPS 后访问：
+
+```text
+https://你的域名/chat
+```
+
+## 5.5 端到端实时语音（通话版小微）+ HTTPS
+
+视频通话的"实时语音"用 StepFun `stepaudio-2.5-realtime`，是 WebSocket 端到端语音，
+浏览器调摄像头/麦克风、连 wss **都要求 HTTPS（安全上下文）**，所以必须先配证书。
+
+**a) 环境变量**（`.env`）：
+```bash
+STEP_API_KEY=你的阶跃key            # platform.stepfun.com 申请；勿提交
+WEWALLET_VOICECALL_PROVIDER=stepfun  # 看材料的视觉识别用 step-3.7-flash
+WEWALLET_COOKIE_SECURE=1             # 上 HTTPS 后开启
+```
+其余 realtime 开关（后端=realtime、中继监听 0.0.0.0、同源路径 /voicecall-relay）
+已写进 `docker-compose.yml`，无需手动设。中继访问令牌默认每次启动随机生成。
+
+**b) 镜像依赖**：`deploy/hermes-agent-requirements.txt` 已含 `websockets`，
+`docker compose up -d --build` 重新构建即装上（中继靠它，缺了实时语音不可用）。
+
+**c) Nginx WebSocket 反代**：`deploy/nginx/wewallet.conf` 已加 `location /voicecall-relay`
+反代到 `app:8789`（含 `map $http_upgrade` 与长超时）。
+
+**d) HTTPS 证书**（以腾讯云免费证书为例）：
+1. 控制台 → SSL 证书 → 申请免费证书（域名 `www.wewalletpro.online`）→ 验证 → 签发。
+2. 下载 **Nginx** 格式，得到 `*_bundle.crt` 和 `*.key`。
+3. 传到服务器，放进 `deploy/certs/`，改名为 `fullchain.pem` 和 `privkey.pem`。
+4. 打开 `deploy/nginx/wewallet.conf`，**取消文件末尾 443 server 段的整段注释**。
+5. `docker compose up -d`（compose 已映射 443 端口、挂载 `deploy/certs`）。
+6. 云安全组放行 **443**。
+
+完成后手机/电脑访问 `https://www.wewalletpro.online/chat`，登录进视频通话即可实时对话；
+"给小微看材料"会截一帧给 step-3.7-flash 识别后让小微当场转述。
 
 ## 6. 备份
 
@@ -137,7 +129,7 @@ bash deploy/scripts/backup-data.sh
 
 ## 7. 仍需生产化的点
 
-- 当前后端仍是 Python `ThreadingHTTPServer`，已经可以由 Caddy 反代做小规模试点；后续要支持更高并发，建议重构为 ASGI 服务再接 uvicorn/gunicorn。
+- 当前后端仍是 Python `ThreadingHTTPServer`，已经可以由 Nginx 反代做小规模试点；后续要支持更高并发，建议重构为 ASGI 服务再接 uvicorn/gunicorn。
 - AI 对话和画像更新仍是长请求同步执行；试点可以用，正式上线建议接任务队列。
 - 用户、企业、会话当前是 JSON 文件；正式对外建议迁移到 TencentDB。
 - 上传材料当前落本地数据卷；正式对外建议迁移到 COS。

@@ -21,6 +21,9 @@ import db
 
 
 SMS_RESEND_COOLDOWN_SECONDS = 60
+# 同一手机号的有效验证码最多允许猜错的次数：超过即作废，必须重新发码。
+# 没有这道闸，攻击者换 IP 绕过限流后可在 TTL 内穷举 6 位码。
+SMS_MAX_VERIFY_ATTEMPTS = 5
 
 
 def auth_secret() -> str:
@@ -210,17 +213,32 @@ def create_sms_code(phone: str) -> str | None:
 
 
 def consume_sms_code(phone: str, code: str) -> bool:
-    """Return True if `code` matches an unexpired record for `phone`, and delete it."""
+    """Return True if `code` matches an unexpired record for `phone`, and delete it.
+
+    Each wrong guess increments ``attempt_count`` on the phone's live codes;
+    once a code accumulates ``SMS_MAX_VERIFY_ATTEMPTS`` failures it is deleted,
+    so a correct-but-brute-forced code can no longer be consumed.
+    """
     target_hash = hash_value(f"{phone}:{code}")
+    now = now_ts()
     with db.transaction() as conn:
         row = conn.execute(
-            "SELECT id FROM sms_codes WHERE phone = ? AND code_hash = ? AND expires_at > ? LIMIT 1",
-            (phone, target_hash, now_ts()),
+            "SELECT id FROM sms_codes WHERE phone = ? AND code_hash = ? AND expires_at > ? "
+            "AND attempt_count < ? LIMIT 1",
+            (phone, target_hash, now, SMS_MAX_VERIFY_ATTEMPTS),
         ).fetchone()
-        if not row:
-            return False
-        conn.execute("DELETE FROM sms_codes WHERE id = ?", (row["id"],))
-    return True
+        if row:
+            conn.execute("DELETE FROM sms_codes WHERE id = ?", (row["id"],))
+            return True
+        conn.execute(
+            "UPDATE sms_codes SET attempt_count = attempt_count + 1 WHERE phone = ? AND expires_at > ?",
+            (phone, now),
+        )
+        conn.execute(
+            "DELETE FROM sms_codes WHERE phone = ? AND attempt_count >= ?",
+            (phone, SMS_MAX_VERIFY_ATTEMPTS),
+        )
+        return False
 
 
 def send_sms_code(phone: str, code: str) -> None:

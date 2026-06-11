@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WeWallet</title>
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/shared/assets/wewallet-favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="64x64" href="/static/shared/assets/wewallet-favicon-64.png" />
+  <link rel="icon" type="image/png" sizes="256x256" href="/static/shared/assets/wewallet-favicon-256.png" />
+  <link rel="apple-touch-icon" href="/static/shared/assets/wewallet-favicon-256.png" />
+  <link rel="icon" href="/static/shared/assets/wewallet-favicon.ico" sizes="any" />
+  <link rel="stylesheet" href="/static/shared/tokens.css" />
+  <link rel="stylesheet" href="/static/desktop/chat.css" />
+</head>
+<body>
+  <section id="authScreen" class="auth-screen" hidden>
+    <div class="auth-orb auth-orb-1" aria-hidden="true"></div>
+    <div class="auth-orb auth-orb-2" aria-hidden="true"></div>
+    <div class="auth-orb auth-orb-3" aria-hidden="true"></div>
+    <div class="auth-panel">
+      <aside class="auth-hero" aria-hidden="true">
+        <div class="auth-hero-badge">微众银行 · 小微企业服务</div>
+        <h1 class="auth-hero-title">你的 AI 信贷<br />客户经理</h1>
+        <p class="auth-hero-subtitle">懂经营、懂政策、懂你的生意，7×24 小时在线。</p>
+        <ul class="auth-hero-points">
+          <li><span class="auth-point-dot is-blue"></span>智能贷款方案匹配</li>
+          <li><span class="auth-point-dot is-green"></span>经营数据实时洞察</li>
+          <li><span class="auth-point-dot is-purple"></span>企业专属风控画像</li>
+        </ul>
+        <img class="auth-hero-mascot" src="/static/shared/assets/mascot-smile.png" alt="" />
+      </aside>
+      <div class="auth-main">
+      <div class="auth-brand">
+        <div class="brand-mark auth-brand-mark"></div>
+        <div>
+          <div class="auth-title">WeWallet 小微</div>
+          <div class="auth-subtitle">手机号登录后进入企业专属画像</div>
+        </div>
+      </div>
+
+      <form id="loginForm" class="auth-form">
+        <div class="auth-tabs" role="tablist" aria-label="登录方式">
+          <button id="passwordLoginTab" class="auth-tab is-active" type="button">密码登录</button>
+          <button id="smsLoginTab" class="auth-tab" type="button">验证码登录</button>
+        </div>
+        <label>
+          <span>手机号</span>
+          <input id="loginPhone" inputmode="numeric" autocomplete="tel" placeholder="请输入 11 位手机号" />
+        </label>
+        <label id="loginPasswordField">
+          <span>密码</span>
+          <input id="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码" />
+        </label>
+        <div id="loginSmsField" class="auth-code-row" hidden>
+          <label>
+            <span>短信验证码</span>
+            <input id="loginCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码" />
+          </label>
+          <button id="sendLoginCodeButton" class="secondary-button" type="button">获取验证码</button>
+        </div>
+        <button class="primary-button" type="submit">登录</button>
+        <button id="openRegisterButton" class="auth-link-button" type="button">注册账号</button>
+      </form>
+
+      <form id="registerForm" class="auth-form" hidden>
+        <label>
+          <span>手机号</span>
+          <input id="registerPhone" inputmode="numeric" autocomplete="tel" placeholder="请输入 11 位手机号" />
+        </label>
+        <label>
+          <span>密码</span>
+          <input id="registerPassword" type="password" autocomplete="new-password" placeholder="至少 8 位" />
+        </label>
+        <div class="auth-code-row">
+          <label>
+            <span>短信验证码</span>
+            <input id="registerCode" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码" />
+          </label>
+          <button id="sendRegisterCodeButton" class="secondary-button" type="button">获取验证码</button>
+        </div>
+        <button class="primary-button" type="submit">注册</button>
+        <button id="backToLoginButton" class="auth-link-button" type="button">返回登录</button>
+      </form>
+
+      <form id="enterpriseForm" class="auth-form" hidden>
+        <label>
+          <span>企业名称（选填）</span>
+          <input id="enterpriseName" placeholder="可先跳过，后续在资料里补充" />
+        </label>
+        <label>
+          <span>统一社会信用代码（选填）</span>
+          <input id="enterpriseCreditCode" placeholder="后续可补充" />
+        </label>
+        <button class="primary-button" type="submit">创建企业档案</button>
+      </form>
+
+      <p id="authMessage" class="auth-message"></p>
+      </div>
+    </div>
+  </section>
+
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <div class="brand" aria-label="WeWallet 小微">
+          <div class="brand-mark"></div>
+          <div class="brand-name">小微</div>
+        </div>
+        <button id="sidebarToggleButton" class="sidebar-toggle-button" type="button" aria-label="收起侧栏" title="收起侧栏">‹</button>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="主要功能">
+        <button id="openLoanButton" class="nav-item" type="button">
+          <span class="nav-icon" aria-hidden="true">¥</span>
+          <span>贷款额度</span>
+        </button>
+        <button id="openWalletButton" class="nav-item" type="button">
+          <span class="nav-icon" aria-hidden="true">◈</span>
+          <span>经营分析</span>
+        </button>
+        <button id="openProfileButton" class="nav-item" type="button">
+          <span class="nav-icon" aria-hidden="true">▣</span>
+          <span>查看画像</span>
+        </button>
+      </nav>
+
+      <section class="history-section" aria-label="服务说明">
+        <div class="sidebar-section-title">服务说明</div>
+        <div class="test-hints">
+          <p>小微可协助了解融资需求、经营情况和材料准备。</p>
+          <p>画像与钱包数据仅用于当前企业经营服务。</p>
+        </div>
+      </section>
+
+      <div class="account-area">
+        <button id="accountButton" class="account-button" type="button">
+          <span id="accountAvatar" class="account-avatar">企</span>
+          <span class="account-copy">
+            <span id="accountLabel">未登录</span>
+            <span id="sessionStatus" class="panel-note">企业档案</span>
+          </span>
+        </button>
+      </div>
+
+      <footer class="icp-beian icp-beian--sidebar">
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer noopener">桂ICP备2026011057号-1</a>
+      </footer>
+    </aside>
+
+    <main class="chat-stage">
+      <header class="topbar">
+        <div>
+          <div class="topbar-title">
+            <img class="wewallet-wordmark" src="/static/shared/assets/wewallet-wordmark-tight.png" alt="WeWallet" />
+          </div>
+          <div class="topbar-subtitle">小微企业经营与融资服务</div>
+        </div>
+        <button id="mobileMenuButton" class="mobile-menu-button" type="button" aria-label="打开菜单" title="打开菜单">
+          <span></span>
+          <span></span>
+          <span></span>
+        </button>
+      </header>
+
+      <section id="messageList" class="message-list">
+        <div class="empty-state">
+          <div class="empty-mascot" aria-hidden="true">
+            <video class="mascot-video" autoplay muted loop playsinline preload="metadata" poster="/static/shared/assets/mascot-smile.png">
+              <source src="/static/shared/assets/character-loop.webm" type="video/webm" />
+              <img src="/static/shared/assets/mascot-smile.png" alt="" />
+            </video>
+          </div>
+          <h1>聊聊您的生意和资金需求</h1>
+          <div class="prompt-chips" aria-label="快捷指令">
+            <button class="prompt-chip" type="button">我想了解贷款额度</button>
+            <button class="prompt-chip" type="button">最近需要资金周转</button>
+            <button class="prompt-chip" type="button">想看看适合的贷款方案</button>
+            <button class="prompt-chip" type="button">开厂买设备需要一笔钱</button>
+          </div>
+          <footer class="icp-beian icp-beian--home">
+            <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer noopener">桂ICP备2026011057号-1</a>
+          </footer>
+        </div>
+      </section>
+
+      <div id="walletPendingBar" class="wallet-pending-bar" hidden>
+        <div class="wallet-pending-header">
+          <span class="wallet-pending-title">小微想改你的钱包</span>
+          <span id="walletPendingCount" class="wallet-pending-count"></span>
+        </div>
+        <div id="walletPendingList" class="wallet-pending-list"></div>
+      </div>
+      <form id="composerForm" class="composer" autocomplete="off">
+        <div id="attachmentPreview" class="composer-attachments" hidden></div>
+        <div class="composer-inner">
+          <div class="attachment-menu">
+            <button id="imageButton" class="icon-tool" type="button" aria-label="添加附件" title="添加附件">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+            </button>
+            <div id="attachmentPopover" class="attachment-popover" hidden>
+              <button id="pickImageButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 15-5-5L5 19"/></svg>
+                <span>上传图片</span>
+              </button>
+              <button id="pickFileButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z"/><path d="M14 2v5h5"/><path d="M9 13h6"/><path d="M9 17h6"/></svg>
+                <span>上传文件</span>
+              </button>
+              <button id="pickVideoButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="14" height="14" rx="2"/><path d="m17 10 4-3v10l-4-3z"/></svg>
+                <span>上传视频</span>
+              </button>
+              <button id="openVideoCallButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3z"/><circle cx="9" cy="12" r="2"/></svg>
+                <span>视频通话</span>
+              </button>
+            </div>
+          </div>
+          <input id="imageInput" type="file" accept="image/*" multiple hidden />
+          <input id="fileInput" type="file" multiple hidden />
+          <input id="videoInput" type="file" accept="video/*" multiple hidden />
+          <textarea id="messageInput" rows="1" placeholder="请输入您的经营情况、资金需求或材料问题"></textarea>
+          <button id="micButton" class="icon-tool" type="button" aria-label="语音输入" title="语音输入">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/></svg>
+          </button>
+          <button id="sendButton" class="send-button" type="submit" aria-label="发送">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          </button>
+        </div>
+      </form>
+    </main>
+
+    <div id="profileBackdrop" class="audit-backdrop" hidden></div>
+    <aside id="profileDrawer" class="audit-drawer" aria-hidden="true">
+      <div class="audit-header">
+        <div>
+          <h2>风控画像</h2>
+          <p id="profileSummary">查看当前企业的 MD 档案，画像会随对话自动更新。</p>
+        </div>
+        <button id="closeProfileButton" class="icon-button" type="button" aria-label="关闭画像">×</button>
+      </div>
+      <div class="audit-toolbar">
+        <button id="refreshProfileButton" class="secondary-button" type="button">刷新</button>
+      </div>
+      <details id="profileDiffDetails" class="profile-diff-details" hidden>
+        <summary>变更记录</summary>
+        <pre id="profileDiff" class="profile-diff">暂无变更。</pre>
+      </details>
+      <div id="profileMarkdown" class="profile-markdown markdown-body">暂无画像。</div>
+    </aside>
+
+    <div id="walletBackdrop" class="modal-backdrop" hidden></div>
+    <section id="walletDrawer" class="wallet-modal" aria-hidden="true" hidden>
+      <div class="audit-header">
+        <div>
+          <h2>经营分析</h2>
+          <p>企业流水、现金流和收入规划。</p>
+        </div>
+        <button id="closeWalletButton" class="icon-button" type="button" aria-label="关闭钱包">×</button>
+      </div>
+      <div class="wallet-actions">
+        <button id="importWalletButton" class="secondary-button" type="button">导入 CSV</button>
+        <button id="addWalletEntryButton" class="primary-button" type="button">添加流水</button>
+        <input id="walletCsvInput" type="file" accept=".csv,text/csv" hidden />
+      </div>
+      <form id="walletEntryForm" class="wallet-entry-form" hidden>
+        <input id="walletDate" type="date" />
+        <select id="walletType">
+          <option value="income">收入</option>
+          <option value="expense">支出</option>
+        </select>
+        <input id="walletAmount" inputmode="decimal" placeholder="金额" />
+        <input id="walletCategory" placeholder="分类" />
+        <input id="walletDescription" placeholder="摘要" />
+        <button class="primary-button" type="submit">添加</button>
+      </form>
+      <div class="wallet-period-tabs" role="tablist" aria-label="经营周期">
+        <button class="wallet-period-tab is-active" type="button" data-wallet-period="day">日经营</button>
+        <button class="wallet-period-tab" type="button" data-wallet-period="week">周经营</button>
+        <button class="wallet-period-tab" type="button" data-wallet-period="month">月经营</button>
+      </div>
+      <div id="walletSummary" class="wallet-summary"></div>
+      <div class="wallet-dashboard-grid">
+        <div class="wallet-section">
+          <div class="wallet-section-header">
+            <h3>经营图表</h3>
+            <div class="wallet-chart-controls" aria-label="图表类型">
+              <button class="wallet-chart-mode is-active" type="button" data-wallet-chart="bar" title="柱状图" aria-label="柱状图">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10"/><path d="M12 20V4"/><path d="M20 20v-7"/></svg>
+              </button>
+              <button class="wallet-chart-mode" type="button" data-wallet-chart="line" title="折线图" aria-label="折线图">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16 5-5 4 4 7-8"/><path d="M4 20h16"/></svg>
+              </button>
+              <button class="wallet-chart-mode" type="button" data-wallet-chart="pie" title="收支占比" aria-label="收支占比">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9h9"/><path d="M20.5 15A9 9 0 1 1 9 3.5"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="walletChart" class="wallet-chart"></div>
+        </div>
+        <div class="wallet-section">
+          <h3>收入规划</h3>
+          <div id="walletPlan" class="wallet-plan"></div>
+        </div>
+      </div>
+      <div class="wallet-section">
+        <h3>近期流水</h3>
+        <div id="walletTransactions" class="wallet-transactions"></div>
+      </div>
+      <p id="walletMessage" class="account-profile-message"></p>
+    </section>
+
+    <div id="loanBackdrop" class="modal-backdrop" hidden></div>
+    <section id="loanModal" class="loan-modal" aria-hidden="true" hidden>
+      <div class="audit-header">
+        <div>
+          <h2>贷款额度</h2>
+          <p>根据当前风控画像与经营流水，为您预估的授信方案。</p>
+        </div>
+        <button id="closeLoanButton" class="icon-button" type="button" aria-label="关闭贷款额度">×</button>
+      </div>
+      <div class="loan-toolbar">
+        <span id="loanUpdatedAt" class="loan-updated-at"></span>
+        <button id="refreshLoanButton" class="primary-button" type="button">更新评估额度</button>
+      </div>
+      <div id="loanBody" class="loan-body"></div>
+      <p id="loanMessage" class="account-profile-message"></p>
+    </section>
+
+    <div id="videoCallBackdrop" class="modal-backdrop video-call-backdrop" hidden></div>
+    <section id="videoCallModal" class="video-call-modal" aria-hidden="true" hidden>
+      <!-- 自拍画面铺满整屏作背景（小微无画面，靠语音 + 顶部身份呈现） -->
+      <video id="videoCallSelf" class="video-call-video" autoplay muted playsinline></video>
+      <div id="videoCallSelfPlaceholder" class="video-call-self-placeholder">
+        <span class="video-call-self-avatar" aria-hidden="true">我</span>
+        <span class="video-call-hint">正在开启摄像头…</span>
+      </div>
+      <div class="video-call-scrim" aria-hidden="true"></div>
+
+      <!-- 顶部：小微身份 + 状态 + 关闭 -->
+      <header class="video-call-topbar">
+        <div class="video-call-peer">
+          <img class="video-call-peer-avatar" src="/static/shared/assets/xiaowei-avatar-pro.png" alt="小微" />
+          <div class="video-call-peer-meta">
+            <span class="video-call-peer-name">小微</span>
+            <span id="videoCallStatus" class="video-call-peer-status">正在接通…</span>
+          </div>
+        </div>
+        <button id="closeVideoCallButton" class="video-call-close" type="button" aria-label="关闭视频通话">×</button>
+      </header>
+
+      <!-- 实时风控警示：画面疑点 / 口述与档案不符（relay 旁路检测命中时弹出） -->
+      <div id="videoCallRiskAlerts" class="vc-risk-alerts" hidden></div>
+
+      <!-- 中部：小微"在场"光球 + 聆听指示 + 字幕 -->
+      <div class="video-call-center">
+        <div id="videoCallOrb" class="vc-orb is-connecting" aria-hidden="true">
+          <span class="vc-orb-core"></span>
+        </div>
+        <div id="videoCallListening" class="video-call-listening" aria-hidden="true"><span></span><span></span><span></span></div>
+        <p id="videoCallCaption" class="video-call-caption" hidden></p>
+      </div>
+
+      <!-- 底部圆形控制栏 -->
+      <footer class="video-call-dock">
+        <div class="video-call-controls">
+          <button id="videoCallMuteButton" class="vc-btn" type="button" aria-label="静音">
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
+            </span>
+            <span class="vc-btn-label">静音</span>
+          </button>
+          <button id="videoCallStartButton" class="vc-btn vc-btn-camera" type="button" aria-label="摄像头开关">
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 8.5V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-1.5l5 3.5V5l-5 3.5z"/></svg>
+            </span>
+          </button>
+          <button id="videoCallEndButton" class="vc-btn vc-btn-danger" type="button" aria-label="挂断">
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15.5a14 14 0 0 1-4.2-.7 1.3 1.3 0 0 0-1.3.3l-1.8 1.8a15 15 0 0 1-6.6-6.6l1.8-1.8a1.3 1.3 0 0 0 .3-1.3A14 14 0 0 1 8.5 3 1.3 1.3 0 0 0 7.2 1.7H4.3A1.3 1.3 0 0 0 3 3.2 18 18 0 0 0 20.8 21a1.3 1.3 0 0 0 1.5-1.3v-2.9a1.3 1.3 0 0 0-1.3-1.3z" transform="rotate(135 12 12)"/></svg>
+            </span>
+            <span class="vc-btn-label">挂断</span>
+          </button>
+        </div>
+        <p class="video-call-disclaimer">内容由 AI 生成</p>
+      </footer>
+
+      <!-- 旧版"和小微对话"按钮：现由打开即自动接通，隐藏保留供脚本兼容/回落 -->
+      <button id="videoCallTalkButton" type="button" hidden>和小微对话</button>
+    </section>
+
+    <div id="accountBackdrop" class="modal-backdrop" hidden></div>
+    <section id="accountModal" class="profile-modal account-profile-modal" aria-hidden="true" hidden>
+      <div class="profile-modal-header">
+        <div>
+          <h2>账号与企业资料</h2>
+          <p class="profile-note">这里保存用户主动填写的基础资料，不自动覆盖风控画像。</p>
+        </div>
+        <button id="closeAccountButton" class="icon-button" type="button" aria-label="关闭资料">×</button>
+      </div>
+
+      <div class="account-profile-layout">
+        <div class="account-profile-side">
+          <div class="account-profile-card">
+            <button id="avatarUploadButton" class="profile-avatar-button" type="button">
+              <span id="profileAvatarPreview" class="profile-avatar-preview">企</span>
+              <span class="profile-avatar-camera" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 8h4l2-3h4l2 3h4v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+              </span>
+            </button>
+            <div class="account-profile-card-copy">
+              <strong>企业档案</strong>
+              <span>点击头像可更换资料照片</span>
+            </div>
+          </div>
+          <input id="avatarInput" type="file" accept="image/*" hidden />
+          <div class="account-tabs" role="group" aria-label="账号资料分类">
+            <button id="accountTabUser" class="account-tab is-active" type="button">账号资料</button>
+            <button id="accountTabEnterprise" class="account-tab" type="button">企业基本信息</button>
+          </div>
+        </div>
+
+        <form id="accountProfileForm" class="account-profile-form">
+          <section id="accountUserPanel" class="account-profile-panel">
+            <label class="profile-field">
+              <span>手机号</span>
+              <input id="profilePhone" disabled />
+            </label>
+            <label class="profile-field">
+              <span>昵称</span>
+              <input id="profileNickname" placeholder="例如：张总" />
+            </label>
+            <label class="profile-field">
+              <span>身份</span>
+              <input id="profileRole" placeholder="企业主 / 财务负责人 / 合伙人" />
+            </label>
+          </section>
+
+          <section id="accountEnterprisePanel" class="account-profile-panel" hidden>
+            <div class="account-field-grid">
+              <label class="profile-field">
+                <span>企业名称</span>
+                <input id="profileEnterpriseName" placeholder="企业名称" />
+              </label>
+              <label class="profile-field">
+                <span>统一社会信用代码</span>
+                <input id="profileCreditCode" placeholder="可后补" />
+              </label>
+              <label class="profile-field">
+                <span>法定代表人</span>
+                <input id="profileLegalRepresentative" placeholder="可后补" />
+              </label>
+              <label class="profile-field">
+                <span>所在城市</span>
+                <input id="profileCity" placeholder="例如：深圳" />
+              </label>
+              <label class="profile-field account-field-wide">
+                <span>经营地址</span>
+                <input id="profileAddress" placeholder="可后补" />
+              </label>
+              <label class="profile-field">
+                <span>所属行业</span>
+                <input id="profileIndustry" placeholder="例如：批发零售 / 制造 / 餐饮" />
+              </label>
+              <label class="profile-field">
+                <span>主营业务</span>
+                <input id="profileMainBusiness" placeholder="主要产品或服务" />
+              </label>
+              <label class="profile-field">
+                <span>成立时间</span>
+                <input id="profileEstablishedAt" placeholder="例如：2021-06" />
+              </label>
+              <label class="profile-field">
+                <span>经营年限</span>
+                <input id="profileBusinessYears" placeholder="例如：3 年" />
+              </label>
+              <label class="profile-field">
+                <span>企业类型</span>
+                <input id="profileEnterpriseType" placeholder="个体工商户 / 有限责任公司" />
+              </label>
+              <label class="profile-field">
+                <span>年营业额区间</span>
+                <input id="profileAnnualRevenue" placeholder="例如：100-300 万" />
+              </label>
+              <label class="profile-field">
+                <span>员工人数区间</span>
+                <input id="profileEmployeeCount" placeholder="例如：5-10 人" />
+              </label>
+              <label class="profile-field">
+                <span>月均流水区间</span>
+                <input id="profileMonthlyCashflow" placeholder="例如：20-50 万" />
+              </label>
+              <label class="profile-field">
+                <span>是否有对公账户</span>
+                <input id="profileHasCorporateAccount" placeholder="是 / 否 / 待确认" />
+              </label>
+              <label class="profile-field">
+                <span>收款方式</span>
+                <input id="profilePaymentChannels" placeholder="微信 / 支付宝 / POS / 对公" />
+              </label>
+              <label class="profile-field">
+                <span>是否有纳税记录</span>
+                <input id="profileHasTaxRecord" placeholder="是 / 否 / 待确认" />
+              </label>
+              <label class="profile-field">
+                <span>是否缴纳社保</span>
+                <input id="profileHasSocialSecurity" placeholder="是 / 否 / 待确认" />
+              </label>
+              <label class="profile-field">
+                <span>主要资金用途</span>
+                <input id="profileFundingPurpose" placeholder="周转 / 备货 / 设备 / 装修" />
+              </label>
+              <label class="profile-field">
+                <span>期望额度</span>
+                <input id="profileExpectedAmount" placeholder="例如：30 万" />
+              </label>
+              <label class="profile-field">
+                <span>可接受期限</span>
+                <input id="profileExpectedTerm" placeholder="例如：12 个月" />
+              </label>
+            </div>
+          </section>
+
+          <div class="profile-actions">
+            <span id="accountProfileMessage" class="account-profile-message"></span>
+            <button class="primary-button" type="submit">保存资料</button>
+          </div>
+        </form>
+
+        <div class="account-danger-zone">
+          <button id="logoutButton" class="account-tab danger" type="button">退出登录</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <template id="messageTemplate">
+    <article class="message">
+      <div class="avatar"></div>
+      <div class="bubble-wrap">
+        <div class="message-role"></div>
+        <div class="bubble"></div>
+      </div>
+    </article>
+  </template>
+
+  <!-- 加载顺序固定：纯函数层 → 业务核心层 → view 层 → 通话模块 -->
+  <script src="/static/shared/format.js"></script>
+  <script src="/static/shared/core.js"></script>
+  <script src="/static/desktop/chat.js"></script>
+  <script src="/static/desktop/voicecall.js"></script>
+</body>
+</html>

@@ -86,13 +86,17 @@ class ProfileServiceTestCase(unittest.TestCase):
         enterprise_versions_dir(self.ENTERPRISE_ID).mkdir(parents=True, exist_ok=True)
         self._original_gateway_factory = profile_service.gateway_for_enterprise
         self.stub = StubGateway()
-        profile_service.gateway_for_enterprise = lambda _eid, _stub=self.stub: _stub
+        profile_service.gateway_for_enterprise = lambda _eid, slot="", _stub=self.stub: _stub
+        # Pin the interval so these tests stay valid regardless of the env default.
+        self._original_interval = profile_service.AUTO_PROFILE_INTERVAL
+        profile_service.AUTO_PROFILE_INTERVAL = 10
         # Reset the in-memory profile lock so tests don't share state.
         from gateway import PROFILE_UPDATE_LOCKS
         PROFILE_UPDATE_LOCKS.pop(self.ENTERPRISE_ID, None)
 
     def tearDown(self) -> None:
         profile_service.gateway_for_enterprise = self._original_gateway_factory
+        profile_service.AUTO_PROFILE_INTERVAL = self._original_interval
 
     def _wait_for_done(self, timeout: float = 5.0) -> dict:
         deadline = time.monotonic() + timeout

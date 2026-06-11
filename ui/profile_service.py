@@ -88,70 +88,57 @@ def save_profile_state(enterprise_id: str, state: dict[str, Any]) -> None:
     save_json_file(enterprise_profile_state_file(enterprise_id), state)
 
 
-# —— 跨渠道待核验点：视频/语音通话发现的疑点回写到这里，文字与视频两边都会读到并"继续咬住" ——
-OPEN_VERIFICATIONS_KEY = "open_verifications"
-OPEN_VERIFICATIONS_CAP = 50
+# ── 跨渠道待核实项（open verifications）────────────────────────────────────
+# 视频通话挂断后的风控总结（video_calls.schedule_risk_review）把疑点回写到这里，
+# 主聊天和下一通电话的小微都会在 prompt 里看到，跨渠道咬住、不让疑点不了了之。
+# 存在 profile_state.json 里（轻量 JSON，画像更新流程已在读写同一文件）。
+OPEN_VERIFICATIONS_MAX = 12
 
 
-def load_open_verifications(enterprise_id: str) -> list[dict[str, Any]]:
-    items = load_profile_state(enterprise_id).get(OPEN_VERIFICATIONS_KEY)
-    return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
-
-
-def _verification_signature(item: dict[str, Any]) -> str:
-    parts = [str(item.get(k) or "").strip().lower() for k in ("field", "stated", "known", "summary")]
-    return "|".join(parts) if any(parts) else ""
-
-
-def add_open_verifications(
-    enterprise_id: str, items: list[dict[str, Any]], *, source: str = ""
-) -> int:
-    """Append cross-channel verification items (deduped). Returns the number added.
-
-    Locked read-modify-write so a concurrent profile update can't drop entries.
-    """
-    new_items = [i for i in (items or []) if isinstance(i, dict) and _verification_signature(i)]
-    if not new_items:
+def add_open_verifications(enterprise_id: str, items: list[dict[str, Any]]) -> int:
+    """追加待核实项（按文本去重、上限截断），返回实际新增条数。"""
+    if not enterprise_id or not items:
         return 0
-    with DATA_LOCK:
-        state = load_profile_state(enterprise_id)
-        existing = state.get(OPEN_VERIFICATIONS_KEY)
-        existing = [i for i in existing if isinstance(i, dict)] if isinstance(existing, list) else []
-        seen = {_verification_signature(i) for i in existing}
-        added = 0
-        for item in new_items:
-            sig = _verification_signature(item)
-            if sig in seen:
-                continue
-            seen.add(sig)
-            record = dict(item)
-            record.setdefault("source", source)
-            record.setdefault("status", "open")
-            record.setdefault("created_at", iso_now())
-            existing.append(record)
-            added += 1
-        if not added:
-            return 0
-        state[OPEN_VERIFICATIONS_KEY] = existing[-OPEN_VERIFICATIONS_CAP:]
+    state = load_profile_state(enterprise_id)
+    existing = state.get("open_verifications")
+    if not isinstance(existing, list):
+        existing = []
+    known_texts = {str(item.get("text") or "") for item in existing if isinstance(item, dict)}
+    added = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text or text in known_texts:
+            continue
+        known_texts.add(text)
+        existing.append({
+            "text": text,
+            "source": str(item.get("source") or ""),
+            "level": str(item.get("level") or ""),
+            "created_at": iso_now(),
+        })
+        added += 1
+    if added:
+        state["open_verifications"] = existing[-OPEN_VERIFICATIONS_MAX:]
         save_profile_state(enterprise_id, state)
-        return added
+    return added
 
 
-def format_open_verifications_block(enterprise_id: str) -> str:
-    """Prompt block listing cross-channel open items, for chat + video memory."""
-    items = [i for i in load_open_verifications(enterprise_id) if i.get("status", "open") == "open"]
+def list_open_verifications(enterprise_id: str) -> list[dict[str, Any]]:
+    items = load_profile_state(enterprise_id).get("open_verifications")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def open_verifications_block(enterprise_id: str) -> str:
+    """拼成可注入 prompt 的待核实清单；为空返回空串（调用方据此决定是否注入）。"""
+    items = list_open_verifications(enterprise_id)
     if not items:
         return ""
-    lines = ["（以下是此前在视频/语音通话等其他渠道发现、尚未核实清楚的疑点，请在本次对话中自然地继续咬住、温和求证，核实后即可放下）："]
-    for item in items[-12:]:
-        summary = str(item.get("summary") or "").strip()
-        if not summary:
-            field = str(item.get("field") or "某项信息").strip()
-            stated = str(item.get("stated") or "").strip()
-            known = str(item.get("known") or "").strip()
-            summary = f"{field}：曾称“{stated}”，与既有记录“{known}”不一致" if (stated or known) else field
-        src = str(item.get("source") or "").strip()
-        lines.append(f"- {summary}" + (f"（来源：{src}）" if src else ""))
+    lines = []
+    for item in items:
+        source = f"（{item['source']}）" if item.get("source") else ""
+        lines.append(f"- {item.get('text', '')}{source}")
     return "\n".join(lines)
 
 
@@ -314,6 +301,63 @@ def parse_suggestions(content: str, *, limit: int = 3) -> list[str]:
     return cleaned
 
 
+# 规则化快捷追问语料：(触发关键词, 候选追问)。命中小微上一条回复或客户消息里的
+# 关键词就推对应的追问气泡，纯本地匹配、零模型调用——取代原来每轮再跑一次大模型。
+_SUGGESTION_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("额度", "能批", "批多少", "授信", "上限"), ("大概能批多少额度？", "额度是怎么算的？", "怎么才能多批点？")),
+    (("利率", "利息", "年化", "费率", "多少个点"), ("利息具体怎么算？", "有没有更低的利率？", "利息还能优惠吗？")),
+    (("还款", "月供", "分期", "期限", "还多久", "按月", "提前还"), ("每个月还多少？", "最长能借多久？", "能提前还款吗？")),
+    (("流水", "对公", "入账", "银行卡", "账户"), ("流水不够怎么办？", "流水怎么发给你？", "要几个月的流水？")),
+    (("材料", "资料", "证件", "执照", "合同", "报价", "凭证", "上传", "补充", "清单"), ("需要准备哪些材料？", "材料怎么交给你？", "材料齐了多久能批？")),
+    (("纳税", "完税", "开票", "社保", "工资"), ("没怎么纳税有影响吗？", "完税证明在哪开？")),
+    (("用途", "周转", "进货", "采购", "装修", "设备", "扩建"), ("贷款用途有限制吗？", "钱能用来周转吗？")),
+    (("申请", "办理", "流程", "怎么弄", "怎么办", "下一步", "接下来"), ("接下来我要做什么？", "现在就能申请吗？", "多久能放款？")),
+    (("放款", "到账", "多久能下来", "几天"), ("批下来多久到账？", "放款快不快？")),
+    (("抵押", "担保", "征信", "负债", "欠款", "借过"), ("没有抵押能贷吗？", "征信有点问题行吗？")),
+)
+
+_SUGGESTION_FALLBACK = (
+    "大概能批多少额度？", "利息怎么算？", "需要准备哪些材料？", "接下来我要做什么？", "最长能借多久？",
+)
+
+
+def rule_based_suggestions(
+    messages: list[dict[str, Any]] | None,
+    user_message: str,
+    assistant_content: str,
+    enterprise: dict[str, Any] | None = None,
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """本地规则生成快捷追问气泡，零模型调用。
+
+    匹配小微刚回复 + 客户最新输入里的关键词，推相关追问；去掉客户最近几轮已经
+    问过的，凑不满再用兜底池补齐。
+    """
+    haystack = f"{assistant_content}\n{user_message}"
+    recent = " ".join(str(m.get("content") or "") for m in (messages or [])[-6:])
+    picks: list[str] = []
+    seen: set[str] = set()
+
+    def add(chip: str) -> None:
+        text = chip.strip()
+        if text and text not in seen and text[:6] not in recent:
+            seen.add(text)
+            picks.append(text)
+
+    for keywords, chips in _SUGGESTION_RULES:
+        if any(k in haystack for k in keywords):
+            for chip in chips:
+                add(chip)
+                if len(picks) >= limit:
+                    return picks[:limit]
+    for chip in _SUGGESTION_FALLBACK:
+        add(chip)
+        if len(picks) >= limit:
+            break
+    return picks[:limit]
+
+
 _EMOTION_GUIDANCE = {
     "neutral": "情绪平稳，正常沟通。",
     "happy": "客户语气积极。可同样温度推进，但不要过度热情显得不专业。",
@@ -420,13 +464,61 @@ def conversation_drift_turns(messages: list[dict[str, Any]]) -> int:
     return count
 
 
+# 注入聊天 prompt 时只保留对"承接对话 + 交叉验算 + 咬住待核验"最有用的章节，
+# 丢掉只增不减的日志节（字段变更审计、追问记录），既减 token 又更聚焦。
+# "画像"必须在列：客户与企业画像章节存着法定姓名/常用称呼/企业全称——身份核验的
+# 基线。曾因不命中被整段丢掉，导致通话里客户随口报个假名，矛盾检测无从比对。
+_DIGEST_SECTION_KEYWORDS = ("风控结论", "结论", "画像", "经营", "财务", "事实", "风险", "信号", "待核验", "核验", "疑点")
+
+
+def _select_profile_sections(markdown: str) -> str:
+    """抽取风控相关的二级章节（## ...），拼接返回；没有命中则返回空串。"""
+    lines = markdown.splitlines()
+    preamble: list[str] = []
+    blocks: list[tuple[str, list[str]]] = []
+    head: str | None = None
+    body: list[str] = []
+
+    def flush() -> None:
+        nonlocal head, body
+        if head is not None:
+            blocks.append((head, body))
+        body = []
+
+    for line in lines:
+        if re.match(r"^##\s+", line):
+            flush()
+            head = line
+            body = [line]
+        elif head is None:
+            preamble.append(line)
+        else:
+            body.append(line)
+    flush()
+
+    kept = [
+        "\n".join(b).strip()
+        for h, b in blocks
+        if any(keyword in h for keyword in _DIGEST_SECTION_KEYWORDS)
+    ]
+    if not kept:
+        return ""
+    parts = []
+    pre = "\n".join(preamble).strip()
+    if pre:
+        parts.append(pre)
+    parts.extend(kept)
+    return "\n\n".join(parts).strip()
+
+
 def profile_digest_for_prompt(
     enterprise_id: str, *, max_chars: int = PROFILE_DIGEST_MAX_CHARS
 ) -> str:
     """把已生成的风控画像注入聊天 prompt，作为跨轮的长期记忆。
 
-    画像每 10 轮自动更新，沉淀了早期的规模/流水/用途/纳税与待核验点；
-    近期对话窗口只剩最近几轮，更早的事实靠这份画像兜底。
+    画像自动更新（默认每 20 轮），沉淀了早期的规模/流水/用途/纳税与待核验点；
+    近期对话窗口只剩最近几轮，更早的事实靠这份画像兜底。只注入风控相关章节
+    （结论/经营财务事实/风险信号/待核验），丢掉审计与追问日志以省 token。
     """
     if not enterprise_id:
         return "（暂无企业画像，可依据本轮对话判断。）"
@@ -436,10 +528,77 @@ def profile_digest_for_prompt(
         return "（暂无企业画像，可依据本轮对话判断。）"
     if not is_profile_document(markdown):
         return "（画像尚未生成——对话还不足以自动建档，请依据本轮对话和已知事实判断。）"
-    text = markdown.strip()
+    text = _select_profile_sections(markdown) or markdown.strip()
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "\n…（画像较长，已截断）"
+
+
+def build_call_memory_context(
+    enterprise_id: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    tail_turns: int = 8,
+) -> str:
+    """构建视频/语音通话的"开场记忆"——让通话版小微一接通就认得这个客户。
+
+    主聊天与通话共享同一份长期记忆：企业风控画像（蒸馏）+ 最近几条对话 tail。
+    这段文字在**通话建立时一次性**注入通话人设，不在每轮音频环里跑，故不影响实时
+    延迟；为控住每轮 token 增量，画像只取风控相关章节、历史只取最近 tail_turns 条。
+
+    返回拼好的一段中文记忆；没有任何记忆时返回空串（调用方据此决定是否注入）。
+    """
+    if not enterprise_id:
+        return ""
+    parts: list[str] = []
+
+    # 只在画像**真正蒸馏过**时才注入画像段：企业一创建就落了一份空白模板，模板带章节
+    # 标题、会被 is_profile_document 当成"有效画像"，但字段全空、毫无客户事实。用 profile_state
+    # 里的 last_profile_updated_at 作权威信号——没生成过就跳过画像，避免给新客户灌一坨空表格。
+    profile_generated = bool(load_profile_state(enterprise_id).get("last_profile_updated_at"))
+    if profile_generated:
+        digest = profile_digest_for_prompt(enterprise_id)
+        if digest and not digest.startswith("（"):
+            parts.append(
+                "【此前文字沟通沉淀的档案（其中经营类型、店铺/场所、身份、金额、用途等"
+                "多为客户自述、尚未核实，别照念、更别当成已证实的事实）】\n" + digest
+            )
+
+    if messages:
+        tail = transcript_tail_for_prompt(messages, limit=tail_turns)
+        if tail and tail != "（暂无历史对话）":
+            parts.append(
+                "【最近的文字对话片段（含客户自报和你当时的随口回应；你的附和/客套"
+                "不代表那件事已坐实）】\n" + tail
+            )
+
+    # 上通视频通话沉淀的待核实疑点：这通电话里找自然开口温和核对（藏在闲聊里做，
+    # 别像查户口，更别提"系统/风控/记录"）。
+    open_items = open_verifications_block(enterprise_id)
+    if open_items:
+        parts.append("【此前通话沉淀的待核实疑点（找自然时机温和核对，闭合前别放过）】\n" + open_items)
+
+    if not parts:
+        return ""
+    # 反欺诈硬约束：记忆是"客户自报、未核实"的背景，绝不能凌驾于实时画面之上——否则
+    # 会把客户自己编的身份/场景洗成"可信记忆"，瓦解视频通话最关键的画面 vs 口述交叉核验
+    # （曾出现回归：注入记忆后，客户在宿舍谎称"在火锅店"，小微因记忆里记着他做餐饮而附和）。
+    return (
+        "（以下是系统在接通时给你的客户记忆，只给你看、绝不读出来或说「系统告诉我」，"
+        "自然地当成你本来就记得这位客户。但务必牢记：\n"
+        "① 记忆里关于客户的经营类型、店铺/场所、身份、金额、用途等，多是客户**自己口头声称、"
+        "尚未核实**的（不少已被标为存疑/待核验），它只帮你想起聊过什么、还差什么没核实，"
+        "**绝不是已证实的事实**。\n"
+        "② **实时画面永远优先于记忆**：当前摄像头看到的若与记忆里客户自报的场景/身份冲突，"
+        "**一律以当前画面为准**，当场用好奇、不指控的口吻核对，绝不能因为"
+        "「记忆里他说过开火锅店」就附和他此刻「我在火锅店」的说法。\n"
+        "③ 记忆里你之前的附和、客套，不代表那件事已坐实，别当成已确认的结论继续沿用。\n"
+        "④ **客户当前说法与这份记忆里已记录的口径不一致时**（姓名/称呼、企业名、金额、"
+        "用途、经营时间等），不管哪边才是真的，都要**当场温和点出不一致并请客户确认**"
+        "（「我这边记的是 X，您刚说 Y，帮我对一下哈」），核清之前沿用记忆里的口径、"
+        "**绝不默默换成客户的新说法**；客户反复更改关键信息是重要风险信号，要正面指出。）\n\n"
+        + "\n\n".join(parts)
+    )
 
 
 def wallet_facts_block(enterprise_id: str) -> str:
@@ -468,48 +627,6 @@ def wallet_facts_block(enterprise_id: str) -> str:
     return "\n".join(lines)
 
 
-def build_call_memory(enterprise_id: str, enterprise: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Assemble a video-call memory packet from the same long-term memory the
-    text chat uses: the risk profile (画像, incl. open verification items) and
-    the real wallet ledger anchors.
-
-    Returns ``{"has_profile": bool, "text": str, "enterprise": {...}}``. ``text``
-    is a self-contained Chinese block ready to be injected into the realtime
-    model's context and handed to the contradiction detector as the "known
-    facts" baseline. When no profile exists yet, ``has_profile`` is False and
-    ``text`` carries only whatever anchors we do have.
-    """
-    enterprise = enterprise or {}
-    name = str(enterprise.get("name") or "当前企业")
-    credit_code = str(enterprise.get("credit_code") or "")
-
-    digest = profile_digest_for_prompt(enterprise_id)
-    has_profile = is_profile_document(digest)
-    wallet = wallet_facts_block(enterprise_id)
-
-    lines = [f"企业名称：{name}"]
-    if credit_code:
-        lines.append(f"统一社会信用代码：{credit_code}")
-    lines.append("")
-    lines.append("【风控画像（含历史事实与待核验点）】")
-    lines.append(digest)
-    lines.append("")
-    lines.append("【系统经营流水事实（交叉验算的真实锚点，以此为准，不要只信口述）】")
-    lines.append(wallet)
-
-    cross_channel = format_open_verifications_block(enterprise_id)
-    if cross_channel:
-        lines.append("")
-        lines.append("【跨渠道待核验点（其他渠道发现、尚未核实，请继续咬住）】")
-        lines.append(cross_channel)
-
-    return {
-        "has_profile": has_profile,
-        "enterprise": {"name": name, "credit_code": credit_code},
-        "text": "\n".join(lines).strip(),
-    }
-
-
 def build_gateway_chat_turn(
     messages: list[dict[str, str]],
     user_message: str,
@@ -529,16 +646,16 @@ def build_gateway_chat_turn(
     wallet_pending_block = _wallet_pending_block(enterprise_id)
     profile_digest = profile_digest_for_prompt(enterprise_id)
     wallet_facts = wallet_facts_block(enterprise_id)
-    cross_channel_block = format_open_verifications_block(enterprise_id) or "（暂无其他渠道遗留的待核验点。）"
+    open_verifications = open_verifications_block(enterprise_id) or "（暂无视频通话沉淀的待核实项。）"
 
     # 回归主航道：以"小微自己连续几轮没做贷款工作"为准（客户夹个关键词刷不掉）。
+    # 不判断客户是否告别——只在客户给到自然开口时把没闭合的疑点带回，纯寒暄/道别则不硬塞。
     drift = conversation_drift_turns(messages)
     if drift >= OFFTOPIC_STEER_TURNS:
         steer_note = (
-            f"**本轮提示**：你已经连续约 {drift} 轮只在共情/闲聊、没有推进贷款。"
-            "请先自然回应客户当前话题（别冷场），再用一句话把对话温和带回贷款进度、"
-            "还缺的材料或仍未核实清楚的疑点；不要生硬打断。"
-            "若客户正在明确告别 / 暂停，则不拉回（遵循规则 11）。"
+            f"**本轮提示**：你已连续约 {drift} 轮只在共情/闲聊。"
+            "下方'待核验'里若还有没闭合的项，**等客户这轮给到自然开口时**再用一句话温和带回，"
+            "别生硬打断；若本轮客户只是纯寒暄/道别、没有开口，就温暖回应一句，不要硬塞业务。"
         )
     else:
         steer_note = "（小微近几轮仍在推进贷款业务，无需特别引导。）"
@@ -586,7 +703,7 @@ def build_gateway_chat_turn(
    - items 至少 1 项，最多 4 项；name 简短（≤12 字）。
    - JSON 必须能被解析；除该 fenced 块外不要再输出其它代码块。
    - 不要在正文里复述"请上传…"列表，卡片会替你说；正文里点到为止。
-11. **以客户最新消息为准**：客户暂停或告别时，由你结合语境自然判断如何回应，不要机械追加收尾话术，也不要继续强推流程。告别不是永久状态；如果客户之后继续提出实质问题，正常回答当前问题并继续服务。
+11. **始终营业 / 待命，按本轮实际内容成比例回应（不要判断客户是否要走）**：每一轮都**以客户最新消息为准**，只针对这条消息里真实存在的内容作出反应——有问题就正面答清楚（风控问题按规则 3.1 核口径，不能用一个表情或一句"晚安"代替回答），有新信息就接住，有可推进的开口就顺势推进或索取材料。若这一轮没有任何可作答 / 可推进的实质内容（纯寒暄、絮叨、道别），就简短温暖地回应一句即可，**不要凭空制造话术、不要催促、也不要机械追加收尾话术**。告别不是永久状态：你不需要也不要去判断客户"是不是要走"，只看本轮有没有值得回应 / 推进的东西；客户随时回到实质问题就正常服务。
 
 本地知识库片段：
 {knowledge_context}
@@ -606,8 +723,8 @@ def build_gateway_chat_turn(
 经营流水事实（系统实时汇总，做规则 3.1 里"额度/收支是否匹配"验算时以这里的数字为准，不要只信口述）：
 {wallet_facts}
 
-跨渠道待核验点（视频/语音通话等其他渠道发现、尚未核实的疑点，按规则 3.2 继续咬住）：
-{cross_channel_block}
+视频通话沉淀的待核实疑点（挂断后风控总结自动记录；按规则 3.2 跨轮咬住——客户给到自然开口时温和核对，闭合前别不了了之，但绝不对客户说"欺诈/风控/系统记录"等字眼）：
+{open_verifications}
 
 回归主航道（每轮重新判断）：
 {steer_note}
@@ -635,11 +752,6 @@ def build_profile_prompt(messages: list[dict[str, str]], enterprise_id: str, ent
 参考模板：
 {template}
 """
-    cross_channel = format_open_verifications_block(enterprise_id)
-    cross_channel_block = f"""
-其他渠道（如视频/语音通话）发现、尚待核实的疑点（请纳入“待核验”章节，不要遗漏）：
-{cross_channel}
-""" if cross_channel else ""
     return f"""请基于以下贷款客户对话，更新企业风控画像。
 
 要求：
@@ -649,6 +761,7 @@ def build_profile_prompt(messages: list[dict[str, str]], enterprise_id: str, ent
 4. 风险信号要写明事实依据、初步判断、待核验/追问动作。
 5. 如果信息缺失，保留空项或写“待补充”。
 6. 禁止输出思考过程、推理过程、分析过程、内部提示或标签。
+7. **控制档案体积**：未获得新信息的章节原样保留、不要重写扩写；"字段变更审计""追问记录"这类按时间累加的日志，**只保留最近 8 条**，更早的可省略或合并成一句概述，避免档案无限膨胀拖慢生成。
 {template_block}
 
 现有档案：
@@ -656,7 +769,7 @@ def build_profile_prompt(messages: list[dict[str, str]], enterprise_id: str, ent
 
 当前登录企业：
 {enterprise.get("name", "")}
-{cross_channel_block}
+
 对话记录：
 {transcript}
 
@@ -677,7 +790,8 @@ def run_profile_update(
     session_name = f"profile:{enterprise_id}:{time.time_ns()}"
     try:
         profile_path, old_markdown = load_profile_markdown(enterprise_id)
-        gateway = gateway_for_enterprise(enterprise_id)
+        # 独立网关：画像更新（耗时长）不与交互聊天抢同一个子进程。
+        gateway = gateway_for_enterprise(enterprise_id, slot="profile")
         result = gateway.submit(
             session_name,
             build_profile_prompt(messages, enterprise_id, enterprise),
@@ -718,7 +832,7 @@ def run_profile_update(
             "trigger": trigger,
         }
     finally:
-        gateway_for_enterprise(enterprise_id).reset_session(session_name)
+        gateway_for_enterprise(enterprise_id, slot="profile").reset_session(session_name)
         lock.release()
 
 
@@ -919,80 +1033,6 @@ def load_loan_estimate(enterprise_id: str) -> dict[str, Any] | None:
     return saved if isinstance(saved, dict) else None
 
 
-def rule_based_loan_estimate(profile_markdown: str, summary: dict[str, Any]) -> dict[str, Any]:
-    """Conservative fallback used when the model-backed loan engine times out.
-
-    This keeps the product surface usable in demos while making it explicit
-    that the result is a preliminary estimate based only on local records.
-    """
-    tx_count = int(summary.get("transaction_count") or 0)
-    plan = summary.get("plan", {}) if isinstance(summary, dict) else {}
-    avg_income = float(plan.get("avg_monthly_income") or 0)
-    avg_expense = float(plan.get("avg_monthly_expense") or 0)
-    net = float(summary.get("net") or 0)
-
-    if tx_count <= 0 or avg_income <= 0:
-        return {
-            "insufficient": True,
-            "insufficient_hint": "暂时还不够给出额度，先补充近 6 个月流水或和小微聊聊经营情况吧。",
-            "grade": "C",
-            "grade_label": _GRADE_LABELS["C"],
-            "amount_min": 0.0,
-            "amount_max": 0.0,
-            "rate_min": 0.0,
-            "rate_max": 0.0,
-            "term_max_months": 0,
-            "reasons": [],
-            "missing_materials": [{"name": "近6个月流水", "impact": "用于初步测算额度"}],
-            "disclaimer": "预估结果，最终以实际审批为准。",
-            "fallback": True,
-        }
-
-    margin = (avg_income - avg_expense) / max(avg_income, 1.0)
-    income_wan = avg_income / 10000.0
-    net_wan = max(net, 0.0) / 10000.0
-    amount_max = round(max(5.0, min(80.0, income_wan * 2.4 + net_wan * 0.25)), 1)
-    amount_min = round(max(3.0, amount_max * 0.55), 1)
-
-    if tx_count >= 6 and margin >= 0.45:
-        grade, rate_min, rate_max = "B", 7.2, 10.5
-    elif tx_count >= 3 and margin >= 0.2:
-        grade, rate_min, rate_max = "C", 8.5, 12.8
-    else:
-        grade, rate_min, rate_max = "D", 10.8, 15.0
-        amount_max = round(min(amount_max, 20.0), 1)
-        amount_min = round(min(amount_min, amount_max), 1)
-
-    reasons = [
-        f"近 {max(1, len(summary.get('months') or []))} 个月有连续流水",
-        f"月均收入约 {income_wan:.1f} 万",
-    ]
-    if net > 0:
-        reasons.append("账面净流入为正")
-    if "待核验" in profile_markdown:
-        reasons.append("部分材料仍需补齐")
-
-    return {
-        "insufficient": False,
-        "insufficient_hint": "",
-        "grade": grade,
-        "grade_label": _GRADE_LABELS[grade],
-        "amount_min": amount_min,
-        "amount_max": amount_max,
-        "rate_min": rate_min,
-        "rate_max": rate_max,
-        "term_max_months": 12 if grade == "D" else 24,
-        "reasons": reasons[:4],
-        "missing_materials": [
-            {"name": "近6个月流水", "impact": "可提高额度可信度"},
-            {"name": "订单合同", "impact": "证明真实资金用途"},
-            {"name": "纳税记录", "impact": "有助于降低利率"},
-        ],
-        "disclaimer": "预估结果，最终以实际审批为准；当前为系统保守测算。",
-        "fallback": True,
-    }
-
-
 def run_loan_estimate(enterprise_id: str, enterprise: dict[str, Any]) -> dict[str, Any]:
     """Re-evaluate the loan limit: feed the risk profile + wallet summary to the
     gateway, parse a structured authorization plan, and persist it as the new
@@ -1007,12 +1047,9 @@ def run_loan_estimate(enterprise_id: str, enterprise: dict[str, Any]) -> dict[st
             build_loan_estimate_prompt(markdown, summary, enterprise),
             timeout=45.0,
         )
-        estimate = parse_loan_estimate(str(result.get("content") or ""))
-    except (RuntimeError, TimeoutError) as exc:
-        estimate = rule_based_loan_estimate(markdown, summary)
-        estimate["fallback_reason"] = str(exc)[:160]
     finally:
         gateway.reset_session(session_name)
+    estimate = parse_loan_estimate(str(result.get("content") or ""))
     estimate["generated_at"] = iso_now()
     save_json_file(enterprise_loan_estimate_file(enterprise_id), estimate)
     return estimate

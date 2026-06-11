@@ -286,17 +286,20 @@ class HermesTuiGateway:
 
             event_type = str(event.get("type") or "")
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-
-            if event_type in {"thinking.delta", "reasoning.delta"}:
-                text = str(payload.get("text") or "")
-                if text and is_thinking_status(text):
-                    progress.append({"type": event_type, "text": text, "name": "Hermes"})
-                continue
-
             if event_callback:
                 event_callback(event_type, payload)
 
-            if event_type == "message.delta":
+            if event_type in {"thinking.delta", "reasoning.delta"}:
+                text = str(payload.get("text") or "")
+                if text:
+                    thinking_parts.append(text)
+                    # Only thinking.delta carries short status pings. reasoning.delta
+                    # streams the chain-of-thought token-by-token (each token is short
+                    # and newline-free), so it must not be surfaced as progress or the
+                    # whole reasoning leaks into the progress panel.
+                    if event_type == "thinking.delta" and is_thinking_status(text):
+                        progress.append({"type": event_type, "text": text, "name": "Hermes"})
+            elif event_type == "message.delta":
                 text = str(payload.get("text") or "")
                 if text:
                     content_parts.append(text)
@@ -325,10 +328,14 @@ class HermesTuiGateway:
             raise TimeoutError(self._gateway_error("智能体回复超时"))
 
         visible = final_text or "".join(content_parts)
-        visible, _inline_thinking = split_reasoning(visible)
+        visible, inline_thinking = split_reasoning(visible)
+        if inline_thinking:
+            thinking_parts.append(inline_thinking)
+        if final_reasoning:
+            thinking_parts.append(final_reasoning)
         return {
             "content": sanitize_model_output(visible),
-            "thinking": "",
+            "thinking": "\n\n".join(part.strip() for part in thinking_parts if part and part.strip()).strip(),
             "progress": progress[-120:],
             "inline_diffs": inline_diffs[-20:],
             "raw": {"session_id": sid},
@@ -406,13 +413,21 @@ class HermesTuiGateway:
                 pass
 
 
-def gateway_for_enterprise(enterprise_id: str) -> HermesTuiGateway:
+def gateway_for_enterprise(enterprise_id: str, slot: str = "") -> HermesTuiGateway:
+    """Return the gateway for an enterprise.
+
+    ``slot`` lets heavy background work (e.g. profile updates) run on a
+    separate gateway subprocess so it doesn't serialize behind / contend with
+    the interactive chat gateway. Same enterprise + different slot = a distinct
+    long-lived process keyed as ``"{id}#{slot}"``.
+    """
     home = ensure_enterprise_hermes_home(enterprise_id)
+    key = enterprise_id if not slot else f"{enterprise_id}#{slot}"
     with GATEWAY_LOCK:
-        gateway = GATEWAYS.get(enterprise_id)
+        gateway = GATEWAYS.get(key)
         if gateway is None:
             gateway = HermesTuiGateway(home, enterprise_id=enterprise_id)
-            GATEWAYS[enterprise_id] = gateway
+            GATEWAYS[key] = gateway
         return gateway
 
 
